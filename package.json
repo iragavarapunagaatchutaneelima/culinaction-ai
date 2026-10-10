@@ -1,0 +1,63 @@
+{
+  "name": "culinaction-ai",
+  "version": "0.1.0",
+  "private": true,
+  "description": "CulinAction AI — evidence-backed restaurant decision support (Hyderabad-first)",
+  "type": "module",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "dev": "concurrently -n api,web -c blue,green \"npm:dev:api\" \"npm:dev:web\"",
+    "dev:api": "cross-env API_PORT=8787 tsx watch --env-file-if-exists=.env server/index.ts",
+    "dev:web": "vite",
+    "build": "tsc -p tsconfig.json --noEmit && vite build",
+    "start": "cross-env NODE_ENV=production tsx --env-file-if-exists=.env server/index.ts",
+    "db:migrate": "tsx --env-file-if-exists=.env server/db/migrate-cli.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "vitest run",
+    "test:unit": "vitest run tests/unit",
+    "test:integration": "vitest run tests/integration",
+    "test:e2e": "playwright test",
+    "icons": "node scripts/make-icons.mjs",
+    "dev:test-db": "cross-env DATABASE_PATH=data/manual-test.db API_PORT=8787 concurrently -n api,web -c blue,green \"tsx watch server/index.ts\" \"vite\"",
+    "test:integration:libsql": "cross-env DB_DRIVER=libsql vitest run tests/integration",
+    "build:vercel": "npm run build && node scripts/build-vercel.mjs",
+    "test:e2e:vercel": "cross-env E2E_TARGET=vercel playwright test"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.133.0",
+    "@libsql/client": "^0.18.0",
+    "cross-env": "^10.1.0",
+    "express": "^5.3.0",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "react-router-dom": "^7.18.4",
+    "tsx": "^4.23.15",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@playwright/test": "^1.64.0",
+    "@types/express": "^5.0.6",
+    "@types/node": "^26.6.5",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@types/supertest": "^7.2.1",
+    "@vitejs/plugin-react": "^6.1.2",
+    "concurrently": "^10.0.6",
+    "esbuild": "^0.28.2",
+    "eslint": "^10.12.0",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "globals": "^17.13.0",
+    "prettier": "^3.9.9",
+    "supertest": "^7.3.1",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.71.1",
+    "vite": "^8.3.4",
+    "vitest": "^5.0.3"
+  }
+}
