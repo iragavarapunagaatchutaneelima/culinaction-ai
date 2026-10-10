@@ -82,3 +82,36 @@ The gross quantity per serving is `toBase(qty, unit) ÷ (1 − loss_pct/100)`.
 | ----------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
 | `audit_events`    | `entity_type`, `entity_id`, `action`, `details_json`, `user_id`, `created_at`. Written for every create/update/delete and workflow step |
 | `provider_status` | Single row: `provider`, `model`, `last_checked_at`, `last_result`, `last_error`. **API keys are never stored in the database**          |
+
+## v2 additions (migration 2)
+
+Migration 2 runs with foreign keys disabled, because it rebuilds `waste_logs` and `plan_lines` with new CHECK constraints. It is followed by `PRAGMA foreign_key_check` and was tested on a populated v1 database: all rows were preserved and there were no violations.
+
+| Table / column                                                                               | Meaning                                                                                                                              |
+| -------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `users.is_demo`                                                                              | 1 = anonymous Demo Mode visitor (no usable password; expires after 24 h)                                                             |
+| `outlets.prep_warn_min`, `ready_wait_warn_min`, `ready_wait_high_min`, `delivery_target_min` | Delivery-risk thresholds (minutes), configurable per outlet                                                                          |
+| `menu_items.handling_class`                                                                  | `hot`, `cold`, `ambient` or `frozen`                                                                                                 |
+| `menu_items.handling_max_hold_min`, `handling_verified`                                      | Maximum minutes from preparation to customer, and whether the outlet verified it. Only verified limits are used                      |
+| `inventory_batches.storage_verified_on`                                                      | Date an operator confirmed the batch is stored as required                                                                           |
+| `service_outcomes.qty_transferred`                                                           | Portions moved elsewhere (e.g. staff meal), counted once. sold + remaining + transferred + discarded ≤ prepared                      |
+| `waste_logs.reason`                                                                          | `spoilage`, `expired`, `over_preparation`, `unsold_cooked`, `cancelled_order`, `uncollected_order`, `prep_trim`, `returned`, `other` |
+| `waste_logs.order_id`                                                                        | Links waste from a cancelled, uncollected or returned order                                                                          |
+| `plan_lines.line_type`                                                                       | Adds `order_action`, `dispose_order`                                                                                                 |
+| `plan_lines.subject_type`                                                                    | Adds `order`, `outlet`                                                                                                               |
+
+### `orders`
+
+`order_ref` (unique per outlet), `channel` (`dine_in`, `takeaway`, `own_delivery`, `aggregator`, `other`), `status` (derived from events: `received` … `delivered`, `cancelled`, `uncollected`, `returned`, `closed`), `placed_at`, `est_travel_min` (staff estimate, nullable), `packaging`, `delivery_area`, `delay_reason`, `disposition` (`disposed` once food from a cancelled, uncollected or returned order is recorded), `notes`, `source`.
+
+### `order_items`
+
+`order_id`, `menu_item_id`, `qty`.
+
+### `order_events`
+
+Append-only timeline: `event_type` (`received`, `prep_started`, `prep_completed`, `pack_started`, `pack_completed`, `rider_assigned`, `ready_for_pickup`, `picked_up`, `out_for_delivery`, `delivered`, `cancelled`, `marked_uncollected`, `returned`, `closed`), `occurred_at`, `reason`, `note`, `source`, `user_id`.
+
+### `risk_assessments`
+
+One row per open order per engine run: `level` (`low`, `moderate`, `high`, `insufficient`), `factors_json` (factors and missing information), `run_id`, `assessed_at`.

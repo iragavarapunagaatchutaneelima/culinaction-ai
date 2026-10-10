@@ -1,5 +1,5 @@
 import { Link } from 'react-router-dom';
-import { formatDate, formatDateTime, formatINR } from '../fmt';
+import { formatDate, formatDateTime, formatINR, WASTE_REASON_LABELS } from '../fmt';
 import { useQuery } from '../hooks';
 import { Icon } from '../icons';
 import { useOutlet } from '../session';
@@ -44,6 +44,31 @@ interface Dashboard {
     discarded: number;
   };
   salesHistory: { days: number; last: string | null };
+  delivery: {
+    open: number;
+    waitingForPickup: number;
+    needsDisposition: number;
+    elevated: {
+      id: number;
+      ref: string;
+      level: 'high' | 'moderate';
+      status: string;
+      items: string;
+      readyWaitMin: number | null;
+    }[];
+  };
+  waste7d: { reason: string; entries: number; recordedPaise: number | null; estimatedPaise: number | null }[];
+  recentOutcomes: {
+    id: number;
+    date: string;
+    servicePeriod: string;
+    name: string;
+    prepared: number;
+    sold: number;
+    transferred: number;
+    discarded: number;
+    taskId: number | null;
+  }[];
 }
 
 export function Today() {
@@ -134,7 +159,15 @@ export function Today() {
         </Card>
       )}
 
-      <div className="grid-3">
+      <div className="grid-3 grid-4">
+        <Link to={`${base}/orders`} className="card stat">
+          <div className="label">Orders waiting for pickup</div>
+          <div className="value">{d.delivery.waitingForPickup}</div>
+          <div className="foot">
+            {d.delivery.open} open order(s)
+            {d.delivery.needsDisposition ? ` · ${d.delivery.needsDisposition} need a disposition` : ''}
+          </div>
+        </Link>
         <Link to={`${base}/tasks`} className="card stat">
           <div className="label">Open tasks</div>
           <div className="value">{d.tasks.open}</div>
@@ -142,7 +175,7 @@ export function Today() {
             {d.tasks.dueToday} due today{d.tasks.overdue ? ` · ${d.tasks.overdue} overdue` : ''}
           </div>
         </Link>
-        <Link to={`${base}/plans`} className="card stat">
+        <Link to={`${base}/approvals`} className="card stat">
           <div className="label">Awaiting approval</div>
           <div className="value">{d.approvals.length}</div>
           <div className="foot">{d.drafts} draft plan(s)</div>
@@ -152,6 +185,110 @@ export function Today() {
           <div className="value">{d.stock.expiring.length}</div>
           <div className="foot">ingredients near use-by/expiry</div>
         </Link>
+      </div>
+
+      {d.delivery.elevated.length > 0 && (
+        <Card
+          title="Orders with elevated delivery risk"
+          tone={d.delivery.elevated.some((e) => e.level === 'high') ? 'danger' : 'warn'}
+          actions={
+            <Link className="btn sm" to={`${base}/orders`}>
+              All orders
+            </Link>
+          }
+        >
+          <ul className="list">
+            {d.delivery.elevated.map((e) => (
+              <li key={e.id}>
+                <Link className="list-item" to={`${base}/orders/${e.id}`}>
+                  <div className="grow">
+                    <div className="title small">
+                      Order {e.ref} · {e.items}
+                    </div>
+                    <div className="meta">
+                      {e.readyWaitMin !== null
+                        ? `Waiting ${e.readyWaitMin} min for pickup`
+                        : e.status.replace(/_/g, ' ')}
+                    </div>
+                  </div>
+                  <Badge kind={e.level === 'high' ? 'danger' : 'warn'}>
+                    {e.level === 'high' ? 'High risk' : 'Moderate risk'}
+                  </Badge>
+                  <Icon.Chevron className="chev" />
+                </Link>
+              </li>
+            ))}
+          </ul>
+        </Card>
+      )}
+
+      <div className="grid-2">
+        <Card
+          title={<h2>Recorded waste, last 7 days</h2>}
+          actions={
+            <Link className="btn sm" to={`${base}/waste`}>
+              Waste & surplus
+            </Link>
+          }
+        >
+          {d.waste7d.length === 0 ? (
+            <div className="card-body small muted">No waste recorded in the last 7 days.</div>
+          ) : (
+            <ul className="list">
+              {d.waste7d.map((w) => (
+                <li key={w.reason} className="list-item" style={{ minHeight: 0 }}>
+                  <div className="grow small">
+                    {WASTE_REASON_LABELS[w.reason] ?? w.reason}{' '}
+                    <span className="muted">
+                      · {w.entries} entr{w.entries === 1 ? 'y' : 'ies'}
+                    </span>
+                  </div>
+                  <div className="right small nowrap">
+                    {w.recordedPaise ? (
+                      <div>
+                        {formatINR(w.recordedPaise)} <Prov kind="actual" />
+                      </div>
+                    ) : null}
+                    {w.estimatedPaise ? (
+                      <div>
+                        {formatINR(w.estimatedPaise)} <Prov kind="estimate" />
+                      </div>
+                    ) : null}
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+        </Card>
+        <Card
+          title="Recent recorded outcomes"
+          actions={
+            <Link className="btn sm" to={`${base}/verify`}>
+              Verify outcomes
+            </Link>
+          }
+        >
+          {d.recentOutcomes.length === 0 ? (
+            <div className="card-body small muted">No service outcomes recorded yet.</div>
+          ) : (
+            <ul className="list">
+              {d.recentOutcomes.map((o) => (
+                <li key={o.id} className="list-item" style={{ minHeight: 0 }}>
+                  <div className="grow small">
+                    <strong>{o.name}</strong>{' '}
+                    <span className="muted">
+                      · {formatDate(o.date)} {o.servicePeriod}
+                    </span>
+                    {o.taskId && <Badge kind="info">from plan</Badge>}
+                  </div>
+                  <div className="small nowrap">
+                    {o.prepared} prep · {o.sold} sold · {o.discarded} disc.
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+        </Card>
       </div>
 
       <div className="grid-2">

@@ -3,20 +3,25 @@
 ## Overview
 
 ```
- Browser (React SPA, PWA manifest)            Server (Express 5, Node 24)                 Storage
- ─────────────────────────────────            ──────────────────────────────              ─────────────
- pages/ ── api.ts ──fetch /api/*──────────►   auth middleware (session cookie,           data/culinaction.db
-                     X-CulinAction header      role + outlet membership checks)           (node:sqlite, WAL,
-                                               │                                          foreign_keys=ON)
-                                               ├─ routes/* (Zod-validated)  ───────────►
-                                               ├─ shared/engine.ts  (pure, deterministic)
-                                               ├─ shared/forecast.ts, units.ts, money.ts
-                                               └─ server/ai/provider.ts ──HTTPS──► Anthropic Messages API
-                                                    (only when ANTHROPIC_API_KEY is set; explicit user action)
+ Browser (React SPA, PWA)                     Server (Express 5)                               Storage
+ ────────────────────────                     ──────────────────                               ───────
+ /           Landing (public)                 loadUser: picks ca_session or ca_demo cookie     Db interface (async)
+ /demo/...   Demo Mode ── X-CulinAction-Mode  csrfGuard (X-CulinAction header)                  ├─ SqliteDb  node:sqlite file
+ /app/...    Real Mode (sign-in)   : demo     outletAccess + requireRole (server-side)          │   (dev, tests, self-host)
+   api.ts ──fetch /api/*────────────────────► routes/* (Zod-validated)                          └─ LibsqlDb  Turso over HTTP
+                                              ├─ shared/engine.ts      deterministic decisions       (Vercel)
+                                              ├─ shared/orders.ts      order lifecycle & durations
+                                              ├─ shared/deliveryRisk.ts rule-based quality risk
+                                              ├─ shared/whatIf.ts      simulator
+                                              ├─ shared/explain.ts     rule-based explanation (no AI)
+                                              ├─ server/demo.ts        per-visitor demo sandbox
+                                              └─ server/ai/provider.ts ─HTTPS─► Anthropic (optional, validated)
 ```
 
-- **One process**. In development Vite serves the SPA on :5173 and proxies `/api` to Express on :8787. In production Express serves `dist/web` and the API from one port.
-- **`shared/`** contains pure functions with no I/O. The server loads rows from SQLite, maps them to plain objects and calls the engine. This keeps the trusted arithmetic testable without a database.
+- **Development**: Vite on :5173 proxies `/api` to Express on :8787. **Self-hosted production**: Express serves `dist/web` and the API on one port. **Vercel**: static files + one bundled Node.js function (`server/vercel.ts`) via the Build Output API — see [DEPLOYMENT.md](DEPLOYMENT.md).
+- **`shared/`** contains pure functions with no I/O. The server loads rows, maps them to plain objects and calls the engine, so trusted arithmetic is testable without a database.
+- **Data layer**: `server/db/database.ts` defines one async `Db` interface with two drivers that share all SQL and migrations. Transactions use `AsyncLocalStorage` so nested calls become savepoints; migrations that rebuild tables run with foreign keys disabled and are followed by `PRAGMA foreign_key_check`.
+- **Two modes**: Real Mode (accounts, `ca_session` cookie) and Demo Mode (anonymous per-visitor sandbox, `ca_demo` cookie, outlets flagged `is_illustrative`). The client sends `X-CulinAction-Mode: demo` from Demo pages; the server only resolves a demo cookie to a demo user and a real cookie to a real user. See [SECURITY.md](SECURITY.md).
 
 ## Data rules
 
@@ -122,3 +127,38 @@ draft ──submit──► awaiting_approval ──approve──► approved �
 - Every outlet-scoped route checks membership and role on the server.
 - All SQL uses prepared statements. React escapes output. CSV export prefixes cells starting with `= + - @ \t \r` with `'`.
 - Secrets come only from environment variables; `.env` is git-ignored; API key never sent to the browser.
+
+## v2 additions
+
+### Orders and delivery (`shared/orders.ts`, `shared/deliveryRisk.ts`, `server/routes/orders.ts`)
+
+- Orders have items and an append-only **event timeline** (`order_events`). `applyEvent` validates each event against the current status (state machine) and requires non-decreasing, non-future timestamps. Status is derived from the replayed events.
+- `durations()` computes preparation, packing, ready→pickup wait (ongoing waits measured to "now"), delivery, total and hold time (prep completed → delivered/now) **only between recorded timestamps**.
+- `orderStage()` classifies cancellations: before preparation, during preparation, prepared not packed, packed not collected, dispatched not delivered, delivered, returned.
+- `assessDeliveryRisk()` returns `low | moderate | high | insufficient` with every contributing factor. Rules are in [FOOD_SAFETY_AND_RISK_RULES.md](FOOD_SAFETY_AND_RISK_RULES.md). Assessments for open orders are stored in `risk_assessments` on every engine run.
+
+### New engine generators
+
+| Kind                | Tier                                               | Options                                                                                                                   |
+| ------------------- | -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `pickup_delay`      | 1 if a verified handling limit is exceeded, else 2 | (C) manager review before hand-over [only when limit exceeded] · (A) alert staff / chase pickup · (B) record delay reason |
+| `order_disposition` | 2                                                  | (A) record disposal as waste (closes order) · (B) hold until verified limit [never for returned food]                     |
+| `prep_bottleneck`   | 3                                                  | (A) investigate · (B) record delay reasons for a week (needs ≥ 5 orders)                                                  |
+
+Expiry-waste options now start with a **storage-check task** when the batch's storage was not confirmed today. Preparation adjustment sums service-period outcomes per day before comparing with the daily forecast, and counts transferred portions as left over.
+
+### What-if simulator (`shared/whatIf.ts`)
+
+- **Preparation**: for each candidate quantity → ingredient use (recipe × portions, incl. loss), remaining usable stock after this dish and the forecast use of other dishes, shortfall, max portions from stock, ingredient cost; plus a replay against each comparable historical day (days short, days with surplus, average surplus/shortfall, estimated surplus cost and lost sales). No probabilities are invented.
+- **Purchasing**: days of cover before/after, whether above target cover, and quantity likely unused before its date (existing stock used first).
+
+### Explanations
+
+- `ruleBasedExplanation()` (`shared/explain.ts`) is returned with every recommendation item: it only re-arranges the engine's text and picks the first feasible actionable option.
+- The AI provider (optional) must return `recommended_option`; `validateExplanation()` rejects infeasible options (`safety_conflict`), non-existent options and any number not present in the calculation (`unsupported_claims`). Failures store an error and the UI keeps showing the rule-based summary.
+
+### Demo sandbox (`server/demo.ts`)
+
+- `/api/demo/start` creates a demo user (`is_demo = 1`, no usable password) and seeds four fictional outlets with ~1 100 sales rows, ~230 orders and ~1 800 order events using multi-row inserts (≈ 0.1–0.3 s locally). Every generated timeline is replayed through the real lifecycle validator; sold ≤ prepared is guaranteed and orders never exceed recorded sales.
+- Scenario triggers (`/api/outlets/:oid/demo/scenarios/:n`) create simulated orders relative to "now" or run the engine and return where to navigate.
+- Reset deletes only illustrative outlets owned by that demo user and reseeds. Expired demo users (24 h) are purged when new demos start.

@@ -10,13 +10,26 @@ export class ApiError extends Error {
   }
 }
 
+/** Which session the API calls use. Set once by the mode root (Demo Mode or Real Mode). */
+let apiMode: 'real' | 'demo' = 'real';
+export function setApiMode(m: 'real' | 'demo') {
+  apiMode = m;
+}
+export function getApiMode() {
+  return apiMode;
+}
+
 export async function api<T = unknown>(method: string, path: string, body?: unknown): Promise<T> {
   let res: Response;
   try {
     res = await fetch(`/api${path}`, {
       method,
       credentials: 'same-origin',
-      headers: { 'Content-Type': 'application/json', 'X-CulinAction': '1' },
+      headers: {
+        'Content-Type': 'application/json',
+        'X-CulinAction': '1',
+        ...(apiMode === 'demo' ? { 'X-CulinAction-Mode': 'demo' } : {}),
+      },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
   } catch {

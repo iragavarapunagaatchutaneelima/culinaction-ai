@@ -14,21 +14,27 @@ export const OUTLET_TYPE_LABELS: Record<OutletType, string> = {
 };
 
 export const WASTE_REASONS = [
+  'spoilage',
   'expired',
   'over_preparation',
-  'spoilage',
+  'unsold_cooked',
+  'cancelled_order',
+  'uncollected_order',
   'prep_trim',
   'returned',
   'other',
 ] as const;
 export type WasteReason = (typeof WASTE_REASONS)[number];
 export const WASTE_REASON_LABELS: Record<WasteReason, string> = {
-  expired: 'Expired / past safe-use date',
-  over_preparation: 'Over-preparation',
-  spoilage: 'Spoilage',
-  prep_trim: 'Preparation trim',
-  returned: 'Returned food',
-  other: 'Other',
+  spoilage: 'Ingredient spoilage',
+  expired: 'Expired stock / past safe-use date',
+  over_preparation: 'Excess preparation',
+  unsold_cooked: 'Unsold cooked food',
+  cancelled_order: 'Cancelled prepared order',
+  uncollected_order: 'Uncollected order',
+  prep_trim: 'Preparation waste / trim',
+  returned: 'Customer-returned food',
+  other: 'Other recorded disposal',
 };
 
 export type DataSource = 'manual' | 'csv_import' | 'service_outcome' | 'illustrative' | 'adjustment' | 'task';
@@ -45,6 +51,8 @@ export interface BatchSnap {
   dateValue: string | null;
   quarantined: boolean;
   qualityCheckedOn: string | null;
+  /** date an operator confirmed this batch is stored per its requirement (null = not verified) */
+  storageVerifiedOn?: string | null;
 }
 
 export interface IngredientSnap {
@@ -72,6 +80,9 @@ export interface MenuItemSnap {
   recipeVerified: boolean;
   allergens: string | null;
   allergensVerified: boolean;
+  handlingClass?: 'hot' | 'cold' | 'ambient' | 'frozen' | null;
+  handlingMaxHoldMin?: number | null;
+  handlingVerified?: boolean;
   lines: RecipeLineSnap[];
 }
 
@@ -103,6 +114,10 @@ export interface EngineSettings {
   excessCoverDays: number;
   staleCountDays: number;
   purchaseBufferPct: number;
+  prepWarnMin?: number;
+  readyWaitWarnMin?: number;
+  readyWaitHighMin?: number;
+  deliveryTargetMin?: number;
 }
 
 export interface Snapshot {
@@ -115,12 +130,29 @@ export interface Snapshot {
   sales: SaleSnap[];
   outcomes: OutcomeSnap[];
   pastForecasts: PastForecastSnap[];
+  /** open orders plus orders closed in the last 14 days (optional for callers without orders) */
+  orders?: OrderSnap[];
 }
 
 // ---- Engine output ----
 
-export type LineType = 'prep' | 'purchase' | 'reduce_purchase' | 'discard' | 'verify' | 'count';
-export type SubjectType = 'ingredient' | 'menu_item' | 'batch';
+export type LineType =
+  'prep' | 'purchase' | 'reduce_purchase' | 'discard' | 'verify' | 'count' | 'order_action' | 'dispose_order';
+export type SubjectType = 'ingredient' | 'menu_item' | 'batch' | 'order' | 'outlet';
+
+export interface OrderSnap {
+  id: number;
+  ref: string;
+  channel: string;
+  status: import('./orders').OrderStatus;
+  placedAt: string;
+  estTravelMin: number | null;
+  packaging: string | null;
+  delayReason: string | null;
+  disposition: string | null;
+  items: { menuItemId: number; qty: number }[];
+  events: import('./orders').OrderEvent[];
+}
 
 export interface PlanLineDraft {
   type: LineType;
@@ -153,7 +185,10 @@ export type RecKind =
   | 'prep_adjustment'
   | 'excess_stock'
   | 'forecast_deviation'
-  | 'data_gap';
+  | 'data_gap'
+  | 'pickup_delay'
+  | 'order_disposition'
+  | 'prep_bottleneck';
 
 export interface EvidenceBatch {
   batchId: number;

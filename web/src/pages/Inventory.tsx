@@ -70,6 +70,7 @@ interface Batch {
   dateValue: string | null;
   quarantined: boolean;
   qualityCheckedOn: string | null;
+  storageVerifiedOn: string | null;
   source: string;
   status: string;
   statusReason: string;
@@ -643,6 +644,24 @@ export function IngredientDetail() {
                             <button className="btn sm" onClick={() => setMode({ adjust: b })}>
                               Adjust
                             </button>
+                          )}
+                          {b.dateType &&
+                            b.status !== 'verify' &&
+                            b.status !== 'unsafe' &&
+                            b.storageVerifiedOn !== todayIST() && (
+                              <button
+                                className="btn sm"
+                                onClick={() =>
+                                  flag(b, { storageVerified: true }, 'Storage check recorded for today')
+                                }
+                              >
+                                Storage OK today
+                              </button>
+                            )}
+                          {b.storageVerifiedOn && (
+                            <span className="tiny muted">
+                              Storage checked {formatDate(b.storageVerifiedOn)}
+                            </span>
                           )}
                           {b.status === 'verify' && (
                             <button

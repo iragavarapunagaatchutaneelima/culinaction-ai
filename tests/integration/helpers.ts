@@ -40,12 +40,15 @@ export async function makeApp(
 }
 
 /** Agent that keeps the session cookie and always sends the CSRF header. */
-export function client(app: ReturnType<typeof createApp>) {
+/** mode 'demo' sends the Demo Mode header, so the demo session cookie is used. */
+export function client(app: ReturnType<typeof createApp>, mode: 'real' | 'demo' = 'real') {
   const agent = request.agent(app);
-  const h = { 'X-CulinAction': '1' };
+  const h: Record<string, string> =
+    mode === 'demo' ? { 'X-CulinAction': '1', 'X-CulinAction-Mode': 'demo' } : { 'X-CulinAction': '1' };
   return {
     agent,
-    get: (url: string) => agent.get(url),
+    get: (url: string) =>
+      mode === 'demo' ? agent.get(url).set('X-CulinAction-Mode', 'demo') : agent.get(url),
     post: (url: string, body?: object) =>
       agent
         .post(url)

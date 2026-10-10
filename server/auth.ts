@@ -5,12 +5,16 @@ import type { Db } from './db/database';
 import { forbidden, HttpError, notFound } from './http';
 
 export const SESSION_COOKIE = 'ca_session';
+/** Demo sessions use their own cookie so a visitor can explore the demo without touching a real session. */
+export const DEMO_COOKIE = 'ca_demo';
+export type Mode = 'real' | 'demo';
 const SESSION_DAYS = 14;
 
 export interface AuthUser {
   id: number;
   username: string;
   displayName: string;
+  isDemo: boolean;
 }
 
 export interface OutletRow {
@@ -32,6 +36,10 @@ export interface OutletRow {
   purchase_buffer_pct: number;
   managers_can_approve: number;
   is_illustrative: number;
+  prep_warn_min: number;
+  ready_wait_warn_min: number;
+  ready_wait_high_min: number;
+  delivery_target_min: number;
   created_at: string;
   updated_at: string;
 }
@@ -39,6 +47,7 @@ export interface OutletRow {
 declare module 'express-serve-static-core' {
   interface Request {
     user?: AuthUser;
+    mode?: Mode;
     outlet?: OutletRow;
     role?: Role;
   }
@@ -90,26 +99,61 @@ export function readCookie(req: Request, name: string): string | null {
   return null;
 }
 
-export function sessionCookie(token: string, expires: Date, secure: boolean): string {
-  return `${SESSION_COOKIE}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Strict; Expires=${expires.toUTCString()}${secure ? '; Secure' : ''}`;
+export function sessionCookie(
+  token: string,
+  expires: Date,
+  secure: boolean,
+  name: string = SESSION_COOKIE,
+): string {
+  return `${name}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Strict; Expires=${expires.toUTCString()}${secure ? '; Secure' : ''}`;
 }
-export function clearCookie(): string {
-  return `${SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Expires=Thu, 01 Jan 1970 00:00:00 GMT`;
+export function clearCookie(name: string = SESSION_COOKIE): string {
+  return `${name}=; Path=/; HttpOnly; SameSite=Strict; Expires=Thu, 01 Jan 1970 00:00:00 GMT`;
+}
+
+/**
+ * Which session a request uses. The SPA sends `X-CulinAction-Mode: demo` from Demo Mode pages;
+ * plain GET links (CSV downloads) may pass `?mode=demo`. Anything else is Real Mode.
+ */
+export function requestMode(req: Request): Mode {
+  if (req.get('X-CulinAction-Mode') === 'demo') return 'demo';
+  if ((req.method === 'GET' || req.method === 'HEAD') && req.query.mode === 'demo') return 'demo';
+  return 'real';
 }
 
 export function loadUser(db: Db, now: () => Date) {
   return async (req: Request, _res: Response, next: NextFunction) => {
-    const token = readCookie(req, SESSION_COOKIE);
+    req.mode = requestMode(req);
+    const token = readCookie(req, req.mode === 'demo' ? DEMO_COOKIE : SESSION_COOKIE);
     if (token) {
-      const row = await db.get<{ id: number; username: string; display_name: string; expires_at: string }>(
-        `SELECT u.id, u.username, u.display_name, s.expires_at FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ?`,
+      const row = await db.get<{
+        id: number;
+        username: string;
+        display_name: string;
+        is_demo: number;
+        expires_at: string;
+      }>(
+        `SELECT u.id, u.username, u.display_name, u.is_demo, s.expires_at FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ?`,
         [sha(token)],
       );
-      if (row && row.expires_at > now().toISOString())
-        req.user = { id: row.id, username: row.username, displayName: row.display_name };
+      // A demo cookie only ever resolves to a demo user, and a real cookie only to a real user.
+      if (row && row.expires_at > now().toISOString() && !!row.is_demo === (req.mode === 'demo'))
+        req.user = {
+          id: row.id,
+          username: row.username,
+          displayName: row.display_name,
+          isDemo: !!row.is_demo,
+        };
     }
     next();
   };
+}
+
+/** Blocks actions that only make sense for real accounts (creating real outlets, team management…). */
+export function requireRealUser(req: Request, _res: Response, next: NextFunction) {
+  if (!req.user) return next(new HttpError(401, 'Please sign in.', 'unauthenticated'));
+  if (req.user.isDemo) return next(forbidden('This action is not available in Demo Mode.'));
+  next();
 }
 
 /** Mutating requests must carry a custom header. Cross-site forms cannot set it and CORS is not enabled. */

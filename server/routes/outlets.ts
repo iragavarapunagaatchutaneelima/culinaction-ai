@@ -1,9 +1,8 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import { OUTLET_TYPES } from '../../shared/types';
-import { hashPassword, requireAuth, requireRole, type OutletRow } from '../auth';
+import { hashPassword, requireAuth, requireRealUser, requireRole, type OutletRow } from '../auth';
 import { badRequest, conflict, idParam, notFound, parse } from '../http';
-import { createIllustrativeOutlet } from '../illustrative';
 import { audit, iso, type Deps } from '../services';
 import { optText, reqText } from '../validation';
 import { passwordField } from './auth';
@@ -27,6 +26,10 @@ export function outletDto(o: OutletRow, role?: string) {
     staleCountDays: o.stale_count_days,
     purchaseBufferPct: o.purchase_buffer_pct,
     managersCanApprove: !!o.managers_can_approve,
+    prepWarnMin: o.prep_warn_min,
+    readyWaitWarnMin: o.ready_wait_warn_min,
+    readyWaitHighMin: o.ready_wait_high_min,
+    deliveryTargetMin: o.delivery_target_min,
     isIllustrative: !!o.is_illustrative,
     createdAt: o.created_at,
     updatedAt: o.updated_at,
@@ -36,44 +39,54 @@ export function outletDto(o: OutletRow, role?: string) {
 
 const TIMEZONES = ['Asia/Kolkata'];
 
-export const outletSchema = z.object({
-  name: reqText(80, 'Outlet name'),
-  outletType: z.enum(OUTLET_TYPES, { errorMap: () => ({ message: 'Choose an outlet type' }) }),
-  city: reqText(60, 'City'),
-  locality: optText(80),
-  timezone: z.enum(TIMEZONES as [string]).default('Asia/Kolkata'),
-  preferredMassUnit: z.enum(['g', 'kg']).default('kg'),
-  preferredVolumeUnit: z.enum(['ml', 'L']).default('L'),
-  servicePeriods: z
-    .array(z.string().trim().min(1).max(30))
-    .max(8, 'At most 8 service periods')
-    .default([])
-    .refine(
-      (a) => new Set(a.map((s) => s.toLowerCase())).size === a.length,
-      'Service periods must be unique',
-    ),
-  operatingHours: optText(120),
-  notes: optText(500),
-  expiryWarnDays: z.coerce.number().int().min(0).max(30).default(2),
-  excessCoverDays: z.coerce.number().int().min(1).max(90).default(7),
-  staleCountDays: z.coerce.number().int().min(1).max(60).default(3),
-  purchaseBufferPct: z.coerce.number().int().min(0).max(100).default(10),
-  managersCanApprove: z.boolean().default(true),
-});
+export const outletSchema = z
+  .object({
+    name: reqText(80, 'Outlet name'),
+    outletType: z.enum(OUTLET_TYPES, { errorMap: () => ({ message: 'Choose an outlet type' }) }),
+    city: reqText(60, 'City'),
+    locality: optText(80),
+    timezone: z.enum(TIMEZONES as [string]).default('Asia/Kolkata'),
+    preferredMassUnit: z.enum(['g', 'kg']).default('kg'),
+    preferredVolumeUnit: z.enum(['ml', 'L']).default('L'),
+    servicePeriods: z
+      .array(z.string().trim().min(1).max(30))
+      .max(8, 'At most 8 service periods')
+      .default([])
+      .refine(
+        (a) => new Set(a.map((s) => s.toLowerCase())).size === a.length,
+        'Service periods must be unique',
+      ),
+    operatingHours: optText(120),
+    notes: optText(500),
+    expiryWarnDays: z.coerce.number().int().min(0).max(30).default(2),
+    excessCoverDays: z.coerce.number().int().min(1).max(90).default(7),
+    staleCountDays: z.coerce.number().int().min(1).max(60).default(3),
+    purchaseBufferPct: z.coerce.number().int().min(0).max(100).default(10),
+    managersCanApprove: z.boolean().default(true),
+    prepWarnMin: z.coerce.number().int().min(1).max(240).default(25),
+    readyWaitWarnMin: z.coerce.number().int().min(1).max(240).default(10),
+    readyWaitHighMin: z.coerce.number().int().min(1).max(240).default(20),
+    deliveryTargetMin: z.coerce.number().int().min(5).max(480).default(45),
+  })
+  .refine((v) => v.readyWaitHighMin > v.readyWaitWarnMin, {
+    message: 'The high threshold must be greater than the warning threshold',
+    path: ['readyWaitHighMin'],
+  });
 
 export function outletRoutes(deps: Deps) {
   const { db, now } = deps;
   const r = Router();
   r.use(requireAuth);
 
-  r.post('/', async (req, res) => {
+  r.post('/', requireRealUser, async (req, res) => {
     const b = parse(outletSchema, req.body);
     const ts = iso(now());
     const id = await db.tx(async () => {
       const { lastId } = await db.run(
         `INSERT INTO outlets (name, outlet_type, city, locality, timezone, preferred_mass_unit, preferred_volume_unit, service_periods, operating_hours, notes,
-          expiry_warn_days, excess_cover_days, stale_count_days, purchase_buffer_pct, managers_can_approve, created_at, updated_at)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          expiry_warn_days, excess_cover_days, stale_count_days, purchase_buffer_pct, managers_can_approve,
+          prep_warn_min, ready_wait_warn_min, ready_wait_high_min, delivery_target_min, created_at, updated_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
         [
           b.name,
           b.outletType,
@@ -90,6 +103,10 @@ export function outletRoutes(deps: Deps) {
           b.staleCountDays,
           b.purchaseBufferPct,
           b.managersCanApprove ? 1 : 0,
+          b.prepWarnMin,
+          b.readyWaitWarnMin,
+          b.readyWaitHighMin,
+          b.deliveryTargetMin,
           ts,
           ts,
         ],
@@ -119,13 +136,6 @@ export function outletRoutes(deps: Deps) {
       .json(outletDto((await db.get<OutletRow>('SELECT * FROM outlets WHERE id = ?', [id]))!, 'owner'));
   });
 
-  r.post('/illustrative', async (req, res) => {
-    const id = await createIllustrativeOutlet(db, req.user!.id, now());
-    res
-      .status(201)
-      .json(outletDto((await db.get<OutletRow>('SELECT * FROM outlets WHERE id = ?', [id]))!, 'owner'));
-  });
-
   const o = Router({ mergeParams: true });
 
   o.get('/', (req, res) => res.json(outletDto(req.outlet!, req.role)));
@@ -135,7 +145,8 @@ export function outletRoutes(deps: Deps) {
     await db.tx(async () => {
       await db.run(
         `UPDATE outlets SET name=?, outlet_type=?, city=?, locality=?, timezone=?, preferred_mass_unit=?, preferred_volume_unit=?, service_periods=?, operating_hours=?, notes=?,
-          expiry_warn_days=?, excess_cover_days=?, stale_count_days=?, purchase_buffer_pct=?, managers_can_approve=?, updated_at=? WHERE id=?`,
+          expiry_warn_days=?, excess_cover_days=?, stale_count_days=?, purchase_buffer_pct=?, managers_can_approve=?,
+          prep_warn_min=?, ready_wait_warn_min=?, ready_wait_high_min=?, delivery_target_min=?, updated_at=? WHERE id=?`,
         [
           b.name,
           b.outletType,
@@ -152,6 +163,10 @@ export function outletRoutes(deps: Deps) {
           b.staleCountDays,
           b.purchaseBufferPct,
           b.managersCanApprove ? 1 : 0,
+          b.prepWarnMin,
+          b.readyWaitWarnMin,
+          b.readyWaitHighMin,
+          b.deliveryTargetMin,
           iso(now()),
           req.outlet!.id,
         ],
@@ -175,7 +190,7 @@ export function outletRoutes(deps: Deps) {
   });
 
   // Permanently delete the outlet and all of its records (owner only, name must be typed to confirm).
-  o.delete('/', requireRole('owner'), async (req, res) => {
+  o.delete('/', requireRealUser, requireRole('owner'), async (req, res) => {
     const b = parse(z.object({ confirmName: z.string() }), req.body);
     if (b.confirmName.trim() !== req.outlet!.name)
       throw badRequest('Type the outlet name exactly to confirm deletion.');
@@ -208,7 +223,7 @@ export function outletRoutes(deps: Deps) {
     );
   });
 
-  o.post('/members', requireRole('owner'), async (req, res) => {
+  o.post('/members', requireRealUser, requireRole('owner'), async (req, res) => {
     const b = parse(
       z.object({
         username: z
@@ -267,7 +282,7 @@ export function outletRoutes(deps: Deps) {
     res.status(201).json({ id: userId, username: b.username, displayName: b.displayName, role: b.role });
   });
 
-  o.delete('/members/:uid', requireRole('owner'), async (req, res) => {
+  o.delete('/members/:uid', requireRealUser, requireRole('owner'), async (req, res) => {
     const uid = idParam(req, 'uid');
     if (uid === req.user!.id) throw badRequest('You cannot remove yourself.');
     await db.tx(async () => {

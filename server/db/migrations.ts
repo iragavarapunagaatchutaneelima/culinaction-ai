@@ -1,6 +1,6 @@
 // Ordered schema migrations. Never edit an applied migration — add a new one.
 
-export const MIGRATIONS: { version: number; name: string; sql: string }[] = [
+export const MIGRATIONS: { version: number; name: string; sql: string; foreignKeysOff?: boolean }[] = [
   {
     version: 1,
     name: 'initial schema',
@@ -361,6 +361,138 @@ CREATE TABLE provider_status (
   last_result TEXT,
   last_error TEXT
 );
+`,
+  },
+  {
+    version: 2,
+    name: 'demo mode, delivery orders, waste categories, handling rules',
+    // Rebuilds tables whose CHECK constraints change; runs with foreign keys disabled.
+    foreignKeysOff: true,
+    sql: `
+ALTER TABLE users ADD COLUMN is_demo INTEGER NOT NULL DEFAULT 0;
+
+ALTER TABLE outlets ADD COLUMN prep_warn_min INTEGER NOT NULL DEFAULT 25;
+ALTER TABLE outlets ADD COLUMN ready_wait_warn_min INTEGER NOT NULL DEFAULT 10;
+ALTER TABLE outlets ADD COLUMN ready_wait_high_min INTEGER NOT NULL DEFAULT 20;
+ALTER TABLE outlets ADD COLUMN delivery_target_min INTEGER NOT NULL DEFAULT 45;
+
+ALTER TABLE menu_items ADD COLUMN handling_class TEXT CHECK (handling_class IN ('hot','cold','ambient','frozen'));
+ALTER TABLE menu_items ADD COLUMN handling_max_hold_min INTEGER CHECK (handling_max_hold_min IS NULL OR handling_max_hold_min > 0);
+ALTER TABLE menu_items ADD COLUMN handling_verified INTEGER NOT NULL DEFAULT 0;
+
+ALTER TABLE inventory_batches ADD COLUMN storage_verified_on TEXT;
+
+ALTER TABLE service_outcomes ADD COLUMN qty_transferred REAL NOT NULL DEFAULT 0 CHECK (qty_transferred >= 0);
+
+CREATE TABLE orders (
+  id INTEGER PRIMARY KEY,
+  outlet_id INTEGER NOT NULL REFERENCES outlets(id) ON DELETE CASCADE,
+  order_ref TEXT NOT NULL,
+  channel TEXT NOT NULL CHECK (channel IN ('dine_in','takeaway','own_delivery','aggregator','other')),
+  status TEXT NOT NULL CHECK (status IN ('received','preparing','prepared','packing','packed','ready_for_pickup','picked_up','in_transit','delivered','cancelled','uncollected','returned','closed')),
+  placed_at TEXT NOT NULL,
+  est_travel_min INTEGER CHECK (est_travel_min IS NULL OR est_travel_min >= 0),
+  packaging TEXT,
+  delivery_area TEXT,
+  delay_reason TEXT,
+  disposition TEXT,
+  notes TEXT,
+  source TEXT NOT NULL DEFAULT 'manual',
+  created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE (outlet_id, order_ref)
+);
+CREATE INDEX idx_orders_outlet_status ON orders(outlet_id, status, placed_at);
+
+CREATE TABLE order_items (
+  id INTEGER PRIMARY KEY,
+  order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+  menu_item_id INTEGER NOT NULL REFERENCES menu_items(id) ON DELETE CASCADE,
+  qty REAL NOT NULL CHECK (qty > 0)
+);
+CREATE INDEX idx_order_items_order ON order_items(order_id);
+
+CREATE TABLE order_events (
+  id INTEGER PRIMARY KEY,
+  order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+  outlet_id INTEGER NOT NULL REFERENCES outlets(id) ON DELETE CASCADE,
+  event_type TEXT NOT NULL CHECK (event_type IN ('received','prep_started','prep_completed','pack_started','pack_completed','rider_assigned','ready_for_pickup','picked_up','out_for_delivery','delivered','cancelled','marked_uncollected','returned','closed')),
+  occurred_at TEXT NOT NULL,
+  reason TEXT,
+  note TEXT,
+  source TEXT NOT NULL DEFAULT 'manual',
+  user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX idx_order_events_order ON order_events(order_id, occurred_at);
+
+CREATE TABLE risk_assessments (
+  id INTEGER PRIMARY KEY,
+  outlet_id INTEGER NOT NULL REFERENCES outlets(id) ON DELETE CASCADE,
+  order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+  run_id INTEGER REFERENCES recommendation_runs(id) ON DELETE CASCADE,
+  level TEXT NOT NULL CHECK (level IN ('low','moderate','high','insufficient')),
+  factors_json TEXT NOT NULL,
+  assessed_at TEXT NOT NULL
+);
+CREATE INDEX idx_risk_order ON risk_assessments(order_id, assessed_at);
+
+CREATE TABLE waste_logs_v2 (
+  id INTEGER PRIMARY KEY,
+  outlet_id INTEGER NOT NULL REFERENCES outlets(id) ON DELETE CASCADE,
+  subject_type TEXT NOT NULL CHECK (subject_type IN ('ingredient','menu_item')),
+  ingredient_id INTEGER REFERENCES ingredients(id) ON DELETE CASCADE,
+  menu_item_id INTEGER REFERENCES menu_items(id) ON DELETE CASCADE,
+  batch_id INTEGER REFERENCES inventory_batches(id) ON DELETE SET NULL,
+  qty REAL NOT NULL CHECK (qty > 0),
+  unit TEXT NOT NULL,
+  qty_base REAL NOT NULL,
+  occurred_at TEXT NOT NULL,
+  business_date TEXT NOT NULL,
+  reason TEXT NOT NULL CHECK (reason IN ('expired','spoilage','over_preparation','unsold_cooked','cancelled_order','uncollected_order','prep_trim','returned','other')),
+  notes TEXT,
+  service_period TEXT,
+  cost_paise INTEGER,
+  cost_basis TEXT CHECK (cost_basis IN ('batch_cost','recipe_estimate')),
+  outcome_id INTEGER REFERENCES service_outcomes(id) ON DELETE SET NULL,
+  task_id INTEGER REFERENCES tasks(id) ON DELETE SET NULL,
+  order_id INTEGER REFERENCES orders(id) ON DELETE SET NULL,
+  source TEXT NOT NULL DEFAULT 'manual',
+  created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at TEXT NOT NULL,
+  CHECK ((subject_type = 'ingredient' AND ingredient_id IS NOT NULL) OR (subject_type = 'menu_item' AND menu_item_id IS NOT NULL))
+);
+INSERT INTO waste_logs_v2 (id, outlet_id, subject_type, ingredient_id, menu_item_id, batch_id, qty, unit, qty_base, occurred_at, business_date, reason, notes, service_period, cost_paise, cost_basis, outcome_id, task_id, source, created_by, created_at)
+  SELECT id, outlet_id, subject_type, ingredient_id, menu_item_id, batch_id, qty, unit, qty_base, occurred_at, business_date, reason, notes, service_period, cost_paise, cost_basis, outcome_id, task_id, source, created_by, created_at FROM waste_logs;
+DROP TABLE waste_logs;
+ALTER TABLE waste_logs_v2 RENAME TO waste_logs;
+CREATE INDEX idx_waste_outlet_date ON waste_logs(outlet_id, business_date);
+CREATE INDEX idx_waste_order ON waste_logs(order_id);
+
+CREATE TABLE plan_lines_v2 (
+  id INTEGER PRIMARY KEY,
+  plan_id INTEGER NOT NULL REFERENCES action_plans(id) ON DELETE CASCADE,
+  rec_item_id INTEGER REFERENCES recommendation_items(id) ON DELETE SET NULL,
+  rec_title TEXT,
+  option_key TEXT,
+  option_label TEXT,
+  line_type TEXT NOT NULL CHECK (line_type IN ('prep','purchase','reduce_purchase','discard','verify','count','order_action','dispose_order')),
+  subject_type TEXT NOT NULL CHECK (subject_type IN ('ingredient','menu_item','batch','order','outlet')),
+  subject_id INTEGER NOT NULL,
+  subject_name TEXT NOT NULL,
+  proposed_qty REAL,
+  approved_qty REAL,
+  unit TEXT,
+  note TEXT,
+  estimated_cost_paise INTEGER,
+  estimated_impact_paise INTEGER,
+  original_json TEXT NOT NULL
+);
+INSERT INTO plan_lines_v2 SELECT * FROM plan_lines;
+DROP TABLE plan_lines;
+ALTER TABLE plan_lines_v2 RENAME TO plan_lines;
+CREATE INDEX idx_lines_plan ON plan_lines(plan_id);
 `,
   },
 ];

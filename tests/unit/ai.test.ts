@@ -106,6 +106,7 @@ describe('AI provider adapter', () => {
       uncertainty: [],
       information_to_collect: [],
       suggested_next_step: 'Option A',
+      recommended_option: null,
     };
     expect(unmatchedNumbers(e, { calc: rec.calculation })).toEqual(['25']);
   });

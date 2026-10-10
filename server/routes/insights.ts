@@ -17,6 +17,9 @@ import { ingredientSummaries } from './inventory';
 import { costing } from './menu';
 import { runDto } from './decisions';
 import { outletDto } from './outlets';
+import { riskSnapshot } from './orders';
+import { assessOrders } from '../../shared/engine';
+import { durations, isOpen, preparedButUndelivered } from '../../shared/orders';
 
 const ISO = /^\d{4}-\d{2}-\d{2}$/;
 
@@ -163,6 +166,45 @@ export function insightRoutes({ db, now, ai }: Deps & { ai: AiProvider }) {
         ),
       },
       lastService: lastService && { date: lastOutcomeDate, ...lastService },
+      delivery: await (async () => {
+        const snap = await riskSnapshot(db, o, now());
+        const risks = assessOrders(snap);
+        const open = snap.orders!.filter((x) => isOpen(x.status));
+        const names = new Map(snap.menuItems.map((m) => [m.id, m.name]));
+        return {
+          open: open.length,
+          waitingForPickup: open.filter((x) => x.status === 'ready_for_pickup').length,
+          needsDisposition: snap.orders!.filter(
+            (x) => !x.disposition && preparedButUndelivered(x.events, x.status),
+          ).length,
+          elevated: open
+            .map((x) => ({ x, r: risks.get(x.id)! }))
+            .filter(({ r }) => r.level === 'high' || r.level === 'moderate')
+            .sort((a, b) => (a.r.level === b.r.level ? 0 : a.r.level === 'high' ? -1 : 1))
+            .slice(0, 5)
+            .map(({ x, r }) => ({
+              id: x.id,
+              ref: x.ref,
+              level: r.level,
+              status: x.status,
+              items: x.items.map((i) => `${i.qty} × ${names.get(i.menuItemId) ?? '?'}`).join(', '),
+              readyWaitMin: durations(x.events, x.status, snap.nowIso).readyWaitMin,
+            })),
+        };
+      })(),
+      waste7d: await db.all(
+        `SELECT reason, COUNT(*) AS entries,
+                SUM(CASE WHEN cost_basis = 'batch_cost' THEN cost_paise ELSE 0 END) AS recordedPaise,
+                SUM(CASE WHEN cost_basis = 'recipe_estimate' THEN cost_paise ELSE 0 END) AS estimatedPaise
+         FROM waste_logs WHERE outlet_id = ? AND business_date >= ? GROUP BY reason ORDER BY recordedPaise + estimatedPaise DESC`,
+        [o.id, addDays(today, -6)],
+      ),
+      recentOutcomes: await db.all(
+        `SELECT so.id, so.business_date AS date, so.service_period AS servicePeriod, m.name, so.qty_prepared AS prepared, so.qty_sold AS sold,
+                so.qty_transferred AS transferred, so.qty_discarded AS discarded, so.task_id AS taskId
+         FROM service_outcomes so JOIN menu_items m ON m.id = so.menu_item_id WHERE so.outlet_id = ? ORDER BY so.business_date DESC, so.id DESC LIMIT 5`,
+        [o.id],
+      ),
       salesHistory: {
         days: salesDays,
         last: (await db.get<{ d: string | null }>(
@@ -313,6 +355,36 @@ export function insightRoutes({ db, now, ai }: Deps & { ai: AiProvider }) {
         withoutEstimate: approvedImpact.unknown ?? 0,
       },
       prepComparisons: comparisons,
+      delivery: await (async () => {
+        const snap = await riskSnapshot(db, o, now());
+        const inRange = snap.orders!.filter((x) => {
+          const d = outletToday(o, new Date(x.placedAt));
+          return d >= from && d <= to;
+        });
+        const ds = inRange.map((x) => durations(x.events, x.status, snap.nowIso));
+        const med = (xs: (number | null)[]) => {
+          const a = xs.filter((v): v is number => v !== null).sort((p, q) => p - q);
+          return a.length
+            ? a.length % 2
+              ? a[(a.length - 1) / 2]
+              : (a[a.length / 2 - 1] + a[a.length / 2]) / 2
+            : null;
+        };
+        return {
+          orders: inRange.length,
+          note: 'Orders are loaded for the last 14 days, so longer ranges show at most 14 days of delivery data.',
+          medianPrepMin: med(ds.map((d) => d.prepMin)),
+          medianReadyWaitMin: med(ds.filter((d) => !d.readyWaitOngoing).map((d) => d.readyWaitMin)),
+          medianDeliveryMin: med(ds.map((d) => d.deliveryMin)),
+          waitedOverWarning: ds.filter(
+            (d) => d.readyWaitMin !== null && d.readyWaitMin >= o.ready_wait_warn_min,
+          ).length,
+          withWaitRecorded: ds.filter((d) => d.readyWaitMin !== null).length,
+          cancelledOrUncollected: inRange.filter(
+            (x) => ['cancelled', 'uncollected'].includes(x.status) || x.disposition,
+          ).length,
+        };
+      })(),
     });
   });
 

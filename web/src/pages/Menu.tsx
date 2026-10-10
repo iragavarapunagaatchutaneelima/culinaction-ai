@@ -25,6 +25,7 @@ import {
   FormError,
   Loading,
   PageHead,
+  SelectField,
   Prov,
   TextField,
   useToast,
@@ -38,6 +39,9 @@ interface MenuItem {
   pricePaise: number | null;
   allergens: string | null;
   allergensVerified: boolean;
+  handlingClass: string | null;
+  handlingMaxHoldMin: number | null;
+  handlingVerified: boolean;
   active: boolean;
   recipe: {
     exists: boolean;
@@ -173,6 +177,9 @@ function MenuItemDialog({
     allergens: item?.allergens ?? '',
     allergensVerified: item?.allergensVerified ?? false,
     active: item?.active ?? true,
+    handlingClass: item?.handlingClass ?? '',
+    handlingMaxHoldMin: item?.handlingMaxHoldMin != null ? String(item.handlingMaxHoldMin) : '',
+    handlingVerified: item?.handlingVerified ?? false,
   });
   const submit = () =>
     void f.submit(
@@ -189,6 +196,10 @@ function MenuItemDialog({
         if (!v.category.trim()) e.category = 'Required';
         if (v.priceInr && !/^\d+(\.\d{1,2})?$/.test(v.priceInr))
           e.priceInr = 'Enter rupees, e.g. 70 or 70.50';
+        if (v.handlingMaxHoldMin && !/^[0-9]+$/.test(v.handlingMaxHoldMin))
+          e.handlingMaxHoldMin = 'Whole minutes';
+        if (v.handlingVerified && (!v.handlingClass || !v.handlingMaxHoldMin))
+          e.handlingVerified = 'Choose how it is served and enter the limit first';
         return e;
       },
     );
@@ -245,6 +256,40 @@ function MenuItemDialog({
           onChange={(v) => f.set('allergensVerified', v)}
         />
         <Check label="Active on the menu" checked={f.values.active} onChange={(v) => f.set('active', v)} />
+        <div className="stack-sm" style={{ borderTop: '1px solid var(--line)', paddingTop: 12 }}>
+          <h3>Delivery handling (optional)</h3>
+          <p className="hint">
+            Used by delivery-risk checks. Enter the limit your own food-safety procedure sets — CulinAction
+            does not suggest one.
+          </p>
+          <div className="form-grid">
+            <SelectField
+              label="Served"
+              value={f.values.handlingClass}
+              onChange={(v) => f.set('handlingClass', v)}
+              placeholder="Not specified"
+              options={[
+                { value: 'hot', label: 'Hot' },
+                { value: 'cold', label: 'Cold / chilled' },
+                { value: 'ambient', label: 'Room temperature' },
+                { value: 'frozen', label: 'Frozen' },
+              ]}
+            />
+            <TextField
+              label="Max minutes from preparation to customer"
+              inputMode="numeric"
+              value={f.values.handlingMaxHoldMin}
+              onChange={(v) => f.set('handlingMaxHoldMin', v)}
+              error={f.errors.handlingMaxHoldMin}
+            />
+          </div>
+          <Check
+            label="This handling limit is verified by our food-safety procedure"
+            checked={f.values.handlingVerified}
+            onChange={(v) => f.set('handlingVerified', v)}
+          />
+          {f.errors.handlingVerified && <div className="error small">{f.errors.handlingVerified}</div>}
+        </div>
       </form>
     </Dialog>
   );

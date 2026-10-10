@@ -31,7 +31,14 @@ const splitStatements = (sql: string) =>
     .map((s) => s.trim())
     .filter((s) => s && !/^--[^\n]*$/.test(s));
 
-async function migrateWith(db: Db, execScript: (sql: string) => Promise<void>): Promise<number[]> {
+export type Migration = (typeof MIGRATIONS)[number];
+
+/**
+ * Applies pending migrations. `apply` runs one migration atomically (including its
+ * schema_migrations row); drivers implement it so that migrations which rebuild tables
+ * can run with foreign keys disabled.
+ */
+async function migrateWith(db: Db, apply: (m: Migration) => Promise<void>): Promise<number[]> {
   await db.run(
     'CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL)',
   );
@@ -44,14 +51,7 @@ async function migrateWith(db: Db, execScript: (sql: string) => Promise<void>): 
   for (const m of MIGRATIONS) {
     if (done.has(m.version)) continue;
     try {
-      await db.tx(async () => {
-        await execScript(m.sql);
-        await db.run('INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)', [
-          m.version,
-          m.name,
-          new Date().toISOString(),
-        ]);
-      });
+      await apply(m);
       applied.push(m.version);
     } catch (e) {
       // Another instance may have applied it concurrently (serverless cold starts).
@@ -61,6 +61,11 @@ async function migrateWith(db: Db, execScript: (sql: string) => Promise<void>): 
   }
   return applied;
 }
+
+const migrationRow = (m: Migration): [string, (string | number)[]] => [
+  'INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)',
+  [m.version, m.name, new Date().toISOString()],
+];
 
 // ---------------------------------------------------------------------------
 // node:sqlite driver
@@ -131,7 +136,23 @@ export class SqliteDb implements Db {
   }
 
   migrate() {
-    return migrateWith(this, async (sql) => this.raw.exec(sql));
+    return migrateWith(this, async (m) => {
+      const fkOff = 'foreignKeysOff' in m && m.foreignKeysOff;
+      if (fkOff) this.raw.exec('PRAGMA foreign_keys = OFF');
+      try {
+        await this.tx(async () => {
+          this.raw.exec(m.sql);
+          await this.run(...migrationRow(m));
+          if (fkOff) {
+            const bad = this.raw.prepare('PRAGMA foreign_key_check').all();
+            if (bad.length)
+              throw new Error(`Migration ${m.version} broke ${bad.length} foreign key reference(s)`);
+          }
+        });
+      } finally {
+        if (fkOff) this.raw.exec('PRAGMA foreign_keys = ON');
+      }
+    });
   }
 
   async close() {
@@ -206,8 +227,22 @@ export class LibsqlDb implements Db {
   }
 
   migrate() {
-    return migrateWith(this, async (sql) => {
-      for (const s of splitStatements(sql)) await this.exec(s);
+    return migrateWith(this, async (m) => {
+      const [rowSql, rowArgs] = migrationRow(m);
+      if ('foreignKeysOff' in m && m.foreignKeysOff) {
+        // client.migrate runs the batch in one transaction with foreign keys disabled.
+        await this.client.migrate([
+          ...splitStatements(m.sql).map((sql) => ({ sql, args: [] })),
+          { sql: rowSql, args: rowArgs },
+        ]);
+        const bad = await this.client.execute('PRAGMA foreign_key_check');
+        if (bad.rows.length) throw new Error(`Migration ${m.version} broke foreign key references`);
+        return;
+      }
+      await this.tx(async () => {
+        for (const sql of splitStatements(m.sql)) await this.exec(sql);
+        await this.run(rowSql, rowArgs);
+      });
     });
   }
 

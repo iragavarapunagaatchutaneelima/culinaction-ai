@@ -189,6 +189,7 @@ function TaskDialog({
   );
   const [notes, setNotes] = useState('');
   const [qualityOk, setQualityOk] = useState(false);
+  const [delayReason, setDelayReason] = useState('');
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [effects, setEffects] = useState<string[] | null>(null);
@@ -204,6 +205,7 @@ function TaskDialog({
         actualQty: qty.trim() === '' ? null : Number(qty),
         notes,
         qualityOk,
+        delayReason: delayReason || null,
       });
       toast(mode === 'skip' ? 'Task skipped' : 'Task completed');
       if (r.effects.length || task.type === 'prep') setEffects(r.effects);
@@ -309,11 +311,25 @@ function TaskDialog({
           )}
         {mode === 'complete' && task.type === 'verify' && task.subjectType === 'batch' && (
           <Check
-            label="Quality checked and acceptable today"
+            label="Checked today and acceptable (storage / quality)"
             checked={qualityOk}
             onChange={setQualityOk}
             hint="Only tick after inspecting storage and condition per your procedures. If not acceptable, record it as waste instead."
           />
+        )}
+        {mode === 'complete' && (task.type === 'order_action' || task.type === 'dispose_order') && (
+          <TextField
+            label="Delay reason to record on the order (optional)"
+            value={delayReason}
+            onChange={setDelayReason}
+            placeholder="e.g. Rider arrived late"
+          />
+        )}
+        {mode === 'complete' && task.type === 'dispose_order' && (
+          <Alert kind="warn">
+            Completing this records the order’s food as waste (cancelled / uncollected / returned) at the
+            recipe cost estimate and closes the order.
+          </Alert>
         )}
         <TextField
           label={mode === 'skip' ? 'Reason' : 'Notes (optional)'}

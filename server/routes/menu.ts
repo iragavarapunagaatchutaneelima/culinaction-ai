@@ -17,6 +17,9 @@ interface MenuRow {
   allergens: string | null;
   allergens_verified: number;
   active: number;
+  handling_class: string | null;
+  handling_max_hold_min: number | null;
+  handling_verified: number;
   created_at: string;
   updated_at: string;
   recipe_id: number | null;
@@ -28,14 +31,29 @@ interface MenuRow {
   recipe_updated_at: string | null;
 }
 
-const itemSchema = z.object({
-  name: reqText(80, 'Menu item name'),
-  category: reqText(40, 'Category'),
-  priceInr: rupees,
-  allergens: optText(200),
-  allergensVerified: z.boolean().default(false),
-  active: z.boolean().default(true),
-});
+const itemSchema = z
+  .object({
+    name: reqText(80, 'Menu item name'),
+    category: reqText(40, 'Category'),
+    priceInr: rupees,
+    allergens: optText(200),
+    allergensVerified: z.boolean().default(false),
+    active: z.boolean().default(true),
+    // blank form fields mean "not specified"
+    handlingClass: z.preprocess(
+      (v) => (v === '' ? null : v),
+      z.enum(['hot', 'cold', 'ambient', 'frozen']).nullable().default(null),
+    ),
+    handlingMaxHoldMin: z.preprocess(
+      (v) => (v === '' || v === undefined ? null : v),
+      z.coerce.number().int().min(1, 'At least 1 minute').max(1440).nullable(),
+    ),
+    handlingVerified: z.boolean().default(false),
+  })
+  .refine((v) => !v.handlingVerified || (v.handlingClass && v.handlingMaxHoldMin), {
+    message: 'Enter the handling type and maximum holding time before marking them verified',
+    path: ['handlingVerified'],
+  });
 
 const recipeSchema = z.object({
   yieldPortions: z.coerce
@@ -146,6 +164,9 @@ export function menuRoutes({ db, now }: Deps) {
       pricePaise: m.price_paise,
       allergens: m.allergens,
       allergensVerified: !!m.allergens_verified,
+      handlingClass: m.handling_class,
+      handlingMaxHoldMin: m.handling_max_hold_min,
+      handlingVerified: !!m.handling_verified,
       active: !!m.active,
       updatedAt: m.updated_at,
       recipe: {
@@ -198,7 +219,7 @@ export function menuRoutes({ db, now }: Deps) {
     const ts = iso(now());
     const id = await db.tx(async () => {
       const { lastId } = await db.run(
-        'INSERT INTO menu_items (outlet_id, name, category, price_paise, allergens, allergens_verified, active, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)',
+        'INSERT INTO menu_items (outlet_id, name, category, price_paise, allergens, allergens_verified, active, handling_class, handling_max_hold_min, handling_verified, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
         [
           req.outlet!.id,
           b.name,
@@ -207,6 +228,9 @@ export function menuRoutes({ db, now }: Deps) {
           b.allergens,
           b.allergensVerified ? 1 : 0,
           b.active ? 1 : 0,
+          b.handlingClass,
+          b.handlingMaxHoldMin,
+          b.handlingVerified ? 1 : 0,
           ts,
           ts,
         ],
@@ -236,7 +260,7 @@ export function menuRoutes({ db, now }: Deps) {
     const b = parse(itemSchema, req.body);
     await db.tx(async () => {
       await db.run(
-        'UPDATE menu_items SET name=?, category=?, price_paise=?, allergens=?, allergens_verified=?, active=?, updated_at=? WHERE id=?',
+        'UPDATE menu_items SET name=?, category=?, price_paise=?, allergens=?, allergens_verified=?, active=?, handling_class=?, handling_max_hold_min=?, handling_verified=?, updated_at=? WHERE id=?',
         [
           b.name,
           b.category,
@@ -244,6 +268,9 @@ export function menuRoutes({ db, now }: Deps) {
           b.allergens,
           b.allergensVerified ? 1 : 0,
           b.active ? 1 : 0,
+          b.handlingClass,
+          b.handlingMaxHoldMin,
+          b.handlingVerified ? 1 : 0,
           iso(now()),
           id,
         ],

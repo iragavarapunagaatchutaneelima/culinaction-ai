@@ -41,6 +41,8 @@ const LINE_TYPE: Record<string, string> = {
   discard: 'Remove & record waste',
   verify: 'Check',
   count: 'Count stock',
+  order_action: 'Order follow-up',
+  dispose_order: 'Dispose & record order food',
 };
 
 interface PlanLine {

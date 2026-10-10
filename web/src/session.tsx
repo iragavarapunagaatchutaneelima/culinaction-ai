@@ -5,6 +5,7 @@ export interface User {
   id: number;
   username: string;
   displayName: string;
+  isDemo?: boolean;
 }
 export interface OutletSummary {
   id: number;
@@ -32,6 +33,10 @@ export interface Outlet {
   staleCountDays: number;
   purchaseBufferPct: number;
   managersCanApprove: boolean;
+  prepWarnMin: number;
+  readyWaitWarnMin: number;
+  readyWaitHighMin: number;
+  deliveryTargetMin: number;
   isIllustrative: boolean;
   role: 'owner' | 'manager' | 'staff';
 }
@@ -53,7 +58,14 @@ const SessionCtx = createContext<SessionState>({
 });
 export const useSession = () => useContext(SessionCtx);
 
-export function SessionProvider({ children }: { children: ReactNode }) {
+export type AppMode = 'real' | 'demo';
+const ModeCtx = createContext<AppMode>('real');
+/** 'real' or 'demo' for the current part of the app. */
+export const useMode = () => useContext(ModeCtx);
+/** Route prefix for the current mode: '/app' (Real Mode) or '/demo' (Demo Mode). */
+export const useModeRoot = () => (useMode() === 'demo' ? '/demo' : '/app');
+
+export function SessionProvider({ children, mode = 'real' }: { children: ReactNode; mode?: AppMode }) {
   const [state, setState] = useState<Omit<SessionState, 'refresh' | 'logout'>>({
     status: 'loading',
     user: null,
@@ -62,6 +74,17 @@ export function SessionProvider({ children }: { children: ReactNode }) {
 
   const refresh = useCallback(async () => {
     try {
+      if (mode === 'demo') {
+        // Demo Mode: there is either an active demo session (demo cookie) or none yet.
+        try {
+          const me = await get<{ user: User; outlets: OutletSummary[] }>('/auth/me');
+          return setState({ status: 'signed_in', user: me.user, outlets: me.outlets });
+        } catch (e) {
+          if ((e as { status?: number }).status === 401)
+            return setState({ status: 'signed_out', user: null, outlets: [] });
+          throw e;
+        }
+      }
       const s = await get<{ needsSetup: boolean; user: User | null }>('/auth/state');
       if (s.needsSetup) return setState({ status: 'needs_setup', user: null, outlets: [] });
       if (!s.user) return setState({ status: 'signed_out', user: null, outlets: [] });
@@ -70,18 +93,22 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     } catch {
       setState({ status: 'offline', user: null, outlets: [] });
     }
-  }, []);
+  }, [mode]);
 
   const logout = useCallback(async () => {
-    await post('/auth/logout').catch(() => {});
+    await post(mode === 'demo' ? '/demo/end' : '/auth/logout').catch(() => {});
     setState({ status: 'signed_out', user: null, outlets: [] });
-  }, []);
+  }, [mode]);
 
   useEffect(() => {
     void refresh();
   }, [refresh]);
 
-  return <SessionCtx.Provider value={{ ...state, refresh, logout }}>{children}</SessionCtx.Provider>;
+  return (
+    <ModeCtx.Provider value={mode}>
+      <SessionCtx.Provider value={{ ...state, refresh, logout }}>{children}</SessionCtx.Provider>
+    </ModeCtx.Provider>
+  );
 }
 
 // ---- Current outlet ----

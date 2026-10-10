@@ -2,7 +2,7 @@
 // Caches ONLY the static app shell (HTML, JS, CSS, icons) so the app opens quickly.
 // API responses (private business data) are never cached; they always go to the network.
 // Offline limitation: without a connection to the server, data cannot be loaded or saved.
-const CACHE = 'culinaction-shell-v1';
+const CACHE = 'culinaction-shell-v2';
 
 self.addEventListener('install', () => self.skipWaiting());
 self.addEventListener('activate', (event) => {
@@ -43,7 +43,8 @@ self.addEventListener('fetch', (event) => {
           if (res.ok) caches.open(CACHE).then((c) => c.put('/', res.clone()));
           return res;
         })
-        .catch(() => caches.match('/')),
+        // offline: serve the cached shell; if none is cached yet, retry the network once
+        .catch(() => caches.match('/').then((hit) => hit || fetch(event.request))),
     );
   }
 });

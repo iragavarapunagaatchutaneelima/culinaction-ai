@@ -6,7 +6,6 @@ import { useForm } from '../hooks';
 import { Icon, Logo } from '../icons';
 import { useSession, type Outlet } from '../session';
 import {
-  Alert,
   Badge,
   Button,
   Card,
@@ -35,6 +34,10 @@ export interface OutletFormValues extends Record<string, unknown> {
   staleCountDays: string;
   purchaseBufferPct: string;
   managersCanApprove: boolean;
+  prepWarnMin: string;
+  readyWaitWarnMin: string;
+  readyWaitHighMin: string;
+  deliveryTargetMin: string;
 }
 
 export function outletToForm(o?: Outlet): OutletFormValues {
@@ -53,6 +56,10 @@ export function outletToForm(o?: Outlet): OutletFormValues {
     staleCountDays: String(o?.staleCountDays ?? 3),
     purchaseBufferPct: String(o?.purchaseBufferPct ?? 10),
     managersCanApprove: o?.managersCanApprove ?? true,
+    prepWarnMin: String(o?.prepWarnMin ?? 25),
+    readyWaitWarnMin: String(o?.readyWaitWarnMin ?? 10),
+    readyWaitHighMin: String(o?.readyWaitHighMin ?? 20),
+    deliveryTargetMin: String(o?.deliveryTargetMin ?? 45),
   };
 }
 
@@ -76,6 +83,10 @@ export function formToOutlet(v: OutletFormValues) {
     staleCountDays: v.staleCountDays,
     purchaseBufferPct: v.purchaseBufferPct,
     managersCanApprove: v.managersCanApprove,
+    prepWarnMin: v.prepWarnMin,
+    readyWaitWarnMin: v.readyWaitWarnMin,
+    readyWaitHighMin: v.readyWaitHighMin,
+    deliveryTargetMin: v.deliveryTargetMin,
   };
 }
 
@@ -199,6 +210,41 @@ export function OutletFields({
               hint="If unticked, only the owner can approve or reject."
             />
           </div>
+          <div className="span-2">
+            <h3 style={{ marginTop: 8 }}>Delivery-risk thresholds</h3>
+            <p className="hint">
+              Used by the rule-based delivery risk checks. Set them to match your own procedures.
+            </p>
+          </div>
+          <NumberField
+            integer
+            label="Preparation guideline (min)"
+            value={v.prepWarnMin}
+            onChange={(x) => set('prepWarnMin', x)}
+            error={e.prepWarnMin}
+          />
+          <NumberField
+            integer
+            label="Delivery target (min)"
+            value={v.deliveryTargetMin}
+            onChange={(x) => set('deliveryTargetMin', x)}
+            error={e.deliveryTargetMin}
+            hint="Order received → delivered"
+          />
+          <NumberField
+            integer
+            label="Pickup wait: warning (min)"
+            value={v.readyWaitWarnMin}
+            onChange={(x) => set('readyWaitWarnMin', x)}
+            error={e.readyWaitWarnMin}
+          />
+          <NumberField
+            integer
+            label="Pickup wait: high (min)"
+            value={v.readyWaitHighMin}
+            onChange={(x) => set('readyWaitHighMin', x)}
+            error={e.readyWaitHighMin}
+          />
         </>
       )}
       <TextArea
@@ -217,7 +263,6 @@ export function OutletPicker() {
   const nav = useNavigate();
   const toast = useToast();
   const [creating, setCreating] = useState(outlets.length === 0);
-  const [demoBusy, setDemoBusy] = useState(false);
   const f = useForm(outletToForm());
 
   const create = (e: React.FormEvent) => {
@@ -226,21 +271,8 @@ export function OutletPicker() {
       const o = await post<Outlet>('/outlets', formToOutlet(v));
       await refresh();
       toast('Outlet created');
-      nav(`/o/${o.id}/today`);
+      nav(`/app/o/${o.id}/today`);
     }, validateOutlet);
-  };
-
-  const createDemo = async () => {
-    setDemoBusy(true);
-    try {
-      const o = await post<Outlet>('/outlets/illustrative');
-      await refresh();
-      nav(`/o/${o.id}/today`);
-    } catch (e) {
-      toast((e as Error).message, 'error');
-    } finally {
-      setDemoBusy(false);
-    }
   };
 
   return (
@@ -263,7 +295,7 @@ export function OutletPicker() {
           <ul className="list">
             {outlets.map((o) => (
               <li key={o.id}>
-                <Link className="list-item" to={`/o/${o.id}/today`}>
+                <Link className="list-item" to={`/app/o/${o.id}/today`}>
                   <Icon.Store />
                   <div className="grow">
                     <div className="title">{o.name}</div>
@@ -319,18 +351,13 @@ export function OutletPicker() {
         <Card title="Just exploring?" tone="muted">
           <div className="card-body stack-sm">
             <p className="small">
-              Create a separate <strong>illustrative</strong> workspace filled with clearly-labelled synthetic
-              sample data (a fictional tiffin centre) to try the full workflow. It is kept apart from your
-              real outlets and every screen in it carries an “Illustrative” banner.
+              The interactive <strong>Demo Mode</strong> has four fictional outlets with generated sample
+              data. It runs in a separate sandbox and never touches this account.
             </p>
-            <Alert kind="warn">
-              Sample records are not real Hyderabad restaurant data, recipes, prices or results. Do not
-              present them as such.
-            </Alert>
             <div>
-              <Button onClick={createDemo} busy={demoBusy}>
-                Create illustrative workspace
-              </Button>
+              <Link className="btn" to="/demo">
+                Open Demo Mode
+              </Link>
             </div>
           </div>
         </Card>

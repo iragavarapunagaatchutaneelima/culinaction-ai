@@ -21,6 +21,8 @@ export const ExplanationSchema = z.object({
   uncertainty: z.array(z.string().max(400)).max(5),
   information_to_collect: z.array(z.string().max(300)).max(6),
   suggested_next_step: z.string().max(400),
+  /** key of the option the explanation leans towards, or null — must be a feasible option */
+  recommended_option: z.string().max(4).nullable(),
 });
 export type Explanation = z.infer<typeof ExplanationSchema>;
 
@@ -32,11 +34,12 @@ export type AiErrorCode =
   | 'network'
   | 'provider_error'
   | 'invalid_output'
-  | 'refused';
+  | 'refused'
+  | 'safety_conflict'
+  | 'unsupported_claims';
 
 export type ExplainResult =
-  | { ok: true; explanation: Explanation; model: string; unmatchedNumbers: string[] }
-  | { ok: false; code: AiErrorCode; message: string };
+  { ok: true; explanation: Explanation; model: string } | { ok: false; code: AiErrorCode; message: string };
 
 export interface AiStatus {
   configured: boolean;
@@ -58,7 +61,8 @@ Rules:
 - Do not decide whether food is safe. Do not suggest using any batch the input marks unsafe, expired or needing a check.
 - Do not recommend new recipes, promotions, price changes or supplier orders beyond the options listed.
 - Keep allergen statements exactly as given; never claim a dish is allergen-free.
-- Point out uncertainty and missing information plainly.`;
+- Point out uncertainty and missing information plainly.
+- Set recommended_option to the key of a feasible option you think best fits, or null. Never choose an option marked infeasible.`;
 
 /** Strip the payload down to what the explanation needs (limits data sent to the provider). */
 export function promptPayload(rec: Recommendation, context: { outletType: string; city: string }) {
@@ -93,6 +97,45 @@ export function unmatchedNumbers(explanation: Explanation, input: unknown): stri
   );
   const outNums = norm(JSON.stringify(explanation)).match(/\d+(?:\.\d+)?/g) ?? [];
   return [...new Set(outNums.map((n) => String(Number(n))))].filter((n) => !inputNums.has(n));
+}
+
+/**
+ * Hard checks applied to every AI explanation before it is shown. A response that leans towards an
+ * infeasible option (e.g. one blocked by a food-safety rule) or that states numbers not present in
+ * the calculation is rejected; the UI then shows the deterministic rule-based summary instead.
+ */
+export function validateExplanation(
+  e: Explanation,
+  rec: Recommendation,
+  payload: unknown,
+): { code: AiErrorCode; message: string } | null {
+  if (e.recommended_option !== null) {
+    const opt = rec.options.find((o) => o.key === e.recommended_option);
+    if (!opt)
+      return {
+        code: 'unsupported_claims',
+        message: `The AI referred to an option ("${e.recommended_option}") that does not exist. Response discarded.`,
+      };
+    if (!opt.feasible)
+      return {
+        code: 'safety_conflict',
+        message: `The AI favoured option ${opt.key}, which the engine marked not feasible (${opt.infeasibleReason ?? 'constraint'}). Response discarded.`,
+      };
+  }
+  for (const t of e.tradeoffs) {
+    if (!rec.options.some((o) => o.key === t.option))
+      return {
+        code: 'unsupported_claims',
+        message: `The AI discussed an option ("${t.option}") that does not exist. Response discarded.`,
+      };
+  }
+  const extra = unmatchedNumbers(e, payload);
+  if (extra.length)
+    return {
+      code: 'unsupported_claims',
+      message: `The AI response contained numbers not found in the calculation (${extra.join(', ')}). Response discarded.`,
+    };
+  return null;
 }
 
 export interface AnthropicProviderOptions {
@@ -167,12 +210,9 @@ export function createAnthropicProvider(opts: AnthropicProviderOptions): AiProvi
             code: 'invalid_output',
             message: 'The AI response did not match the expected structure and was discarded.',
           };
-        return {
-          ok: true,
-          explanation: parsed.data,
-          model: response.model,
-          unmatchedNumbers: unmatchedNumbers(parsed.data, payload),
-        };
+        const problem = validateExplanation(parsed.data, rec, payload);
+        if (problem) return { ok: false, ...problem };
+        return { ok: true, explanation: parsed.data, model: response.model };
       } catch (e) {
         return mapError(e);
       }

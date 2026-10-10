@@ -30,7 +30,7 @@ export function authRoutes({ db, now }: Deps, secureCookies: boolean) {
   const r = Router();
 
   r.get('/state', async (req, res) => {
-    const users = (await db.get<{ n: number }>('SELECT COUNT(*) AS n FROM users'))!.n;
+    const users = (await db.get<{ n: number }>('SELECT COUNT(*) AS n FROM users WHERE is_demo = 0'))!.n;
     res.json({ needsSetup: users === 0, user: req.user ?? null });
   });
 
@@ -41,7 +41,7 @@ export function authRoutes({ db, now }: Deps, secureCookies: boolean) {
       req.body,
     );
     const id = await db.tx(async () => {
-      if ((await db.get<{ n: number }>('SELECT COUNT(*) AS n FROM users'))!.n > 0)
+      if ((await db.get<{ n: number }>('SELECT COUNT(*) AS n FROM users WHERE is_demo = 0'))!.n > 0)
         throw conflict('Setup has already been completed. Please sign in.');
       const { lastId } = await db.run(
         'INSERT INTO users (username, display_name, password_hash, created_at) VALUES (?,?,?,?)',
@@ -66,7 +66,7 @@ export function authRoutes({ db, now }: Deps, secureCookies: boolean) {
     );
     loginThrottle(body.username, now().getTime());
     const u = await db.get<{ id: number; username: string; display_name: string; password_hash: string }>(
-      'SELECT * FROM users WHERE username = ?',
+      'SELECT * FROM users WHERE username = ? AND is_demo = 0',
       [body.username],
     );
     if (!u || !verifyPassword(body.password, u.password_hash)) {

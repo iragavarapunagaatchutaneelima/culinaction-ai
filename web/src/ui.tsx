@@ -9,7 +9,7 @@ import {
   type ReactNode,
 } from 'react';
 import { Link } from 'react-router-dom';
-import type { ApiError } from './api';
+import { getApiMode, type ApiError } from './api';
 import { Icon } from './icons';
 
 // ---------------- Toasts ----------------
@@ -560,5 +560,6 @@ export function KV({ items }: { items: [ReactNode, ReactNode][] }) {
 }
 
 export function downloadUrl(path: string) {
-  return `/api${path}`;
+  // Plain links cannot send headers; Demo Mode downloads select the demo session with ?mode=demo (GET only).
+  return `/api${path}${getApiMode() === 'demo' ? `${path.includes('?') ? '&' : '?'}mode=demo` : ''}`;
 }

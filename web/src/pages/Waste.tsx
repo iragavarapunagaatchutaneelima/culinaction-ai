@@ -65,6 +65,7 @@ export function Waste() {
   const today = todayIST();
   const [from, setFrom] = useState(addDays(today, -13));
   const list = useQuery<WasteRow[]>(`${api}/waste?from=${from}&to=${today}`);
+  const outs = useQuery<OutcomeRow[]>(`${api}/outcomes?from=${from}&to=${today}`);
   const ings = useQuery<{ items: IngredientSummary[] }>(`${api}/ingredients`);
   const menu = useQuery<{ id: number; name: string }[]>(`${api}/menu-items`);
   const pre = params.get('ingredient');
@@ -151,7 +152,7 @@ export function Waste() {
   return (
     <div className="stack">
       <PageHead
-        title="Waste log"
+        title="Waste & surplus"
         sub="Record what was thrown away and why. Ingredient waste is removed from stock."
         actions={
           <a className="btn sm" href={downloadUrl(`${api}/export/waste.csv`)}>
@@ -286,6 +287,8 @@ export function Waste() {
         </Card>
       </form>
 
+      <SurplusCard rows={outs.data ?? []} />
+
       <Card
         title={
           <h2>
@@ -388,6 +391,7 @@ interface OutcomeRow {
   prepared: number;
   sold: number;
   remaining: number;
+  transferred: number;
   discarded: number;
   taskId: number | null;
   notes: string | null;
@@ -412,6 +416,7 @@ export function Outcomes() {
     prepared: params.get('prepared') ?? '',
     sold: '',
     remaining: '0',
+    transferred: '0',
     discarded: '0',
     notes: '',
     taskId: params.get('taskId') ?? '',
@@ -421,7 +426,7 @@ export function Outcomes() {
   });
   const v = f.values;
   const n = (s: string) => num(s) ?? 0;
-  const accounted = n(v.sold) + n(v.remaining) + n(v.discarded);
+  const accounted = n(v.sold) + n(v.remaining) + n(v.transferred) + n(v.discarded);
   const prepared = n(v.prepared);
   const item = menu.data?.find((m) => String(m.id) === v.menuItemId);
 
@@ -444,6 +449,7 @@ export function Outcomes() {
           prepared: '',
           sold: '',
           remaining: '0',
+          transferred: '0',
           discarded: '0',
           notes: '',
           taskId: '',
@@ -453,7 +459,7 @@ export function Outcomes() {
       (x) => {
         const e: Record<string, string> = {};
         if (!x.menuItemId) e.menuItemId = 'Choose a menu item';
-        for (const k of ['prepared', 'sold', 'remaining', 'discarded'] as const) {
+        for (const k of ['prepared', 'sold', 'remaining', 'transferred', 'discarded'] as const) {
           const q = num(x[k]);
           if (q === null || Number.isNaN(q) || q < 0) e[k] = 'Enter 0 or more';
         }
@@ -548,6 +554,14 @@ export function Outcomes() {
                 error={f.errors.remaining}
               />
               <TextField
+                label="Transferred (e.g. staff meal, recorded)"
+                inputMode="decimal"
+                value={v.transferred}
+                onChange={(x) => f.set('transferred', x)}
+                error={f.errors.transferred}
+                hint="Counted once — not also as sold or discarded"
+              />
+              <TextField
                 label="Discarded"
                 inputMode="decimal"
                 value={v.discarded}
@@ -623,6 +637,7 @@ export function Outcomes() {
                   <th className="num">Prepared</th>
                   <th className="num">Sold</th>
                   <th className="num">Remaining</th>
+                  <th className="num">Transferred</th>
                   <th className="num">Discarded</th>
                 </tr>
               </thead>
@@ -645,6 +660,7 @@ export function Outcomes() {
                     <td className="num">{o.prepared}</td>
                     <td className="num">{o.sold}</td>
                     <td className="num">{o.remaining}</td>
+                    <td className="num">{o.transferred}</td>
                     <td className="num" style={{ color: o.discarded ? 'var(--danger)' : undefined }}>
                       {o.discarded}
                     </td>
@@ -656,5 +672,90 @@ export function Outcomes() {
         )}
       </Card>
     </div>
+  );
+}
+
+/** Surplus by dish from recorded service outcomes (prepared − sold), split into what happened to it. */
+function SurplusCard({ rows }: { rows: OutcomeRow[] }) {
+  const by = new Map<
+    string,
+    {
+      prepared: number;
+      sold: number;
+      remaining: number;
+      transferred: number;
+      discarded: number;
+      days: number;
+    }
+  >();
+  for (const o of rows) {
+    const x = by.get(o.menuItemName) ?? {
+      prepared: 0,
+      sold: 0,
+      remaining: 0,
+      transferred: 0,
+      discarded: 0,
+      days: 0,
+    };
+    x.prepared += o.prepared;
+    x.sold += o.sold;
+    x.remaining += o.remaining;
+    x.transferred += o.transferred ?? 0;
+    x.discarded += o.discarded;
+    x.days++;
+    by.set(o.menuItemName, x);
+  }
+  const list = [...by.entries()]
+    .filter(([, x]) => x.prepared - x.sold > 0)
+    .sort((a, b) => b[1].prepared - b[1].sold - (a[1].prepared - a[1].sold));
+  return (
+    <Card
+      title={
+        <h2>
+          Surplus from recorded services <Prov kind="actual" />
+        </h2>
+      }
+    >
+      {!list.length ? (
+        <div className="card-body small muted">
+          No surplus in recorded service outcomes for this period. Record outcomes after each service to see
+          surplus here.
+        </div>
+      ) : (
+        <div className="table-wrap">
+          <table className="table">
+            <thead>
+              <tr>
+                <th>Dish</th>
+                <th className="num">Prepared</th>
+                <th className="num">Sold</th>
+                <th className="num">Surplus</th>
+                <th className="num">Kept</th>
+                <th className="num">Transferred</th>
+                <th className="num">Discarded</th>
+              </tr>
+            </thead>
+            <tbody>
+              {list.map(([name, x]) => (
+                <tr key={name}>
+                  <td>
+                    {name}
+                    <div className="tiny muted">{x.days} service record(s)</div>
+                  </td>
+                  <td className="num">{x.prepared}</td>
+                  <td className="num">{x.sold}</td>
+                  <td className="num strong">{Math.round((x.prepared - x.sold) * 10) / 10}</td>
+                  <td className="num">{x.remaining}</td>
+                  <td className="num">{x.transferred}</td>
+                  <td className="num" style={{ color: x.discarded ? 'var(--danger)' : undefined }}>
+                    {x.discarded}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </Card>
   );
 }

@@ -5,6 +5,7 @@ import { formatDateTime } from '../fmt';
 import { useForm, useQuery } from '../hooks';
 import { Icon } from '../icons';
 import { useOutlet, useSession, type Outlet } from '../session';
+import { ThemeToggle } from '../theme';
 import {
   Alert,
   Badge,
@@ -80,6 +81,15 @@ export function Settings() {
           </div>
         </Card>
       </form>
+
+      <Card title="Appearance">
+        <div className="card-body stack-sm">
+          <p className="small muted">
+            Choose light, dark, or follow your device setting. Saved on this device.
+          </p>
+          <ThemeToggle />
+        </div>
+      </Card>
 
       <Card title="AI explanation provider">
         <div className="card-body stack-sm">

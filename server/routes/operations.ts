@@ -73,14 +73,15 @@ export async function recordMenuItemWaste(
     notes: string | null;
     servicePeriod: string | null;
     outcomeId?: number | null;
+    orderId?: number | null;
     source: string;
   },
 ) {
   const cpp = (await costing(db, outlet, now)).perPortion(w.menuItemId);
   const cost = cpp === null ? null : roundPaise(w.qty * cpp);
   const { lastId } = await db.run(
-    `INSERT INTO waste_logs (outlet_id, subject_type, menu_item_id, qty, unit, qty_base, occurred_at, business_date, reason, notes, service_period, cost_paise, cost_basis, outcome_id, source, created_by, created_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    `INSERT INTO waste_logs (outlet_id, subject_type, menu_item_id, qty, unit, qty_base, occurred_at, business_date, reason, notes, service_period, cost_paise, cost_basis, outcome_id, order_id, source, created_by, created_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     [
       outlet.id,
       'menu_item',
@@ -96,6 +97,7 @@ export async function recordMenuItemWaste(
       cost,
       cost === null ? null : 'recipe_estimate',
       w.outcomeId ?? null,
+      w.orderId ?? null,
       w.source,
       userId,
       iso(now),
@@ -221,7 +223,7 @@ export function operationsRoutes({ db, now }: Deps) {
     res.json(
       await db.all(
         `SELECT o.id, o.business_date AS date, o.service_period AS servicePeriod, o.menu_item_id AS menuItemId, m.name AS menuItemName,
-                o.qty_prepared AS prepared, o.qty_sold AS sold, o.qty_remaining AS remaining, o.qty_discarded AS discarded, o.task_id AS taskId, o.notes,
+                o.qty_prepared AS prepared, o.qty_sold AS sold, o.qty_remaining AS remaining, o.qty_transferred AS transferred, o.qty_discarded AS discarded, o.task_id AS taskId, o.notes,
                 o.source, o.created_at AS createdAt, u.display_name AS userName
          FROM service_outcomes o JOIN menu_items m ON m.id = o.menu_item_id LEFT JOIN users u ON u.id = o.created_by
          WHERE o.outlet_id = ? AND o.business_date BETWEEN ? AND ? ORDER BY o.business_date DESC, m.name`,
@@ -239,6 +241,7 @@ export function operationsRoutes({ db, now }: Deps) {
         prepared: nonNegQty,
         sold: nonNegQty,
         remaining: nonNegQty,
+        transferred: nonNegQty.default(0),
         discarded: nonNegQty,
         notes: optText(300),
         taskId: z.number().int().positive().nullish(),
@@ -253,11 +256,14 @@ export function operationsRoutes({ db, now }: Deps) {
       throw badRequest('Outcomes cannot be recorded for a future date.', {
         fields: { date: 'Cannot be in the future' },
       });
-    const accounted = roundQty(b.sold + b.remaining + b.discarded);
+    const accounted = roundQty(b.sold + b.remaining + b.transferred + b.discarded);
     if (accounted > b.prepared + 1e-9) {
-      throw badRequest(`Sold + remaining + discarded (${accounted}) is more than prepared (${b.prepared}).`, {
-        fields: { prepared: 'Must be at least sold + remaining + discarded' },
-      });
+      throw badRequest(
+        `Sold + remaining + transferred + discarded (${accounted}) is more than prepared (${b.prepared}).`,
+        {
+          fields: { prepared: 'Must be at least sold + remaining + discarded' },
+        },
+      );
     }
     const item = await db.get<{ id: number; name: string }>(
       'SELECT id, name FROM menu_items WHERE id = ? AND outlet_id = ?',
@@ -276,8 +282,8 @@ export function operationsRoutes({ db, now }: Deps) {
     const ts = iso(now());
     const result = await db.tx(async () => {
       const { lastId } = await db.run(
-        `INSERT INTO service_outcomes (outlet_id, business_date, service_period, menu_item_id, qty_prepared, qty_sold, qty_remaining, qty_discarded, task_id, notes, source, created_by, created_at)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        `INSERT INTO service_outcomes (outlet_id, business_date, service_period, menu_item_id, qty_prepared, qty_sold, qty_remaining, qty_transferred, qty_discarded, task_id, notes, source, created_by, created_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
         [
           req.outlet!.id,
           b.date,
@@ -286,6 +292,7 @@ export function operationsRoutes({ db, now }: Deps) {
           b.prepared,
           b.sold,
           b.remaining,
+          b.transferred,
           b.discarded,
           b.taskId ?? null,
           b.notes,

@@ -79,6 +79,7 @@ export function summariseWaste(rows: WasteRow[]) {
   let withoutCost = 0;
   const byDay = new Map<string, { recorded: number; estimated: number }>();
   const byReason = new Map<string, number>();
+  const reasonCost = new Map<string, { recorded: number; estimated: number; unknown: number }>();
   let discardedPortions = 0;
   for (const w of rows) {
     const d = byDay.get(w.date) ?? { recorded: 0, estimated: 0 };
@@ -92,6 +93,11 @@ export function summariseWaste(rows: WasteRow[]) {
     }
     byDay.set(w.date, d);
     byReason.set(w.reason, (byReason.get(w.reason) ?? 0) + 1);
+    const rc = reasonCost.get(w.reason) ?? { recorded: 0, estimated: 0, unknown: 0 };
+    if (w.costPaise === null) rc.unknown++;
+    else if (w.costBasis === 'batch_cost') rc.recorded += w.costPaise;
+    else rc.estimated += w.costPaise;
+    reasonCost.set(w.reason, rc);
     if (w.subjectType === 'menu_item') discardedPortions += w.qty;
   }
   return {
@@ -101,7 +107,9 @@ export function summariseWaste(rows: WasteRow[]) {
     entriesWithoutCost: withoutCost,
     discardedPortions: r2(discardedPortions),
     byDay: [...byDay.entries()].sort(([a], [b]) => (a < b ? -1 : 1)).map(([date, v]) => ({ date, ...v })),
-    byReason: [...byReason.entries()].map(([reason, count]) => ({ reason, count })),
+    byReason: [...byReason.entries()]
+      .map(([reason, count]) => ({ reason, count, ...reasonCost.get(reason)! }))
+      .sort((a, b) => b.recorded + b.estimated - (a.recorded + a.estimated)),
   };
 }
 

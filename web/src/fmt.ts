@@ -33,12 +33,15 @@ export const DATE_TYPE_LABEL: Record<string, string> = {
 };
 
 export const WASTE_REASON_LABELS: Record<string, string> = {
-  expired: 'Expired / past safe-use date',
-  over_preparation: 'Over-preparation',
-  spoilage: 'Spoilage',
-  prep_trim: 'Preparation trim',
-  returned: 'Returned food',
-  other: 'Other',
+  spoilage: 'Ingredient spoilage',
+  expired: 'Expired stock / past safe-use date',
+  over_preparation: 'Excess preparation',
+  unsold_cooked: 'Unsold cooked food',
+  cancelled_order: 'Cancelled prepared order',
+  uncollected_order: 'Uncollected order',
+  prep_trim: 'Preparation waste / trim',
+  returned: 'Customer-returned food',
+  other: 'Other recorded disposal',
 };
 
 export const OUTLET_TYPE_LABELS: Record<string, string> = {

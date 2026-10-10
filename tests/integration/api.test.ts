@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { addDays } from '../../shared/dates';
-import { client, createOutlet, erroringProvider, makeApp, NOW, setupOwner, tempDbPath } from './helpers';
+import { client, createOutlet, erroringProvider, makeApp, setupOwner, tempDbPath } from './helpers';
 
 const TODAY = '2026-10-10';
 let cleanups: (() => unknown)[] = [];
@@ -604,24 +604,6 @@ describe('persistence', () => {
     const list = (await c2.get(`/api/outlets/${oid}/ingredients`)).body.items;
     expect(list).toHaveLength(1);
     expect(list[0]).toMatchObject({ name: 'Basmati rice', usableQty: 4000 });
-  });
-});
-
-describe('illustrative workspace', () => {
-  it('is created separately, flagged, and produces recommendations', async () => {
-    const { c } = await fresh();
-    await setupOwner(c);
-    const real = await createOutlet(c);
-    const r = await c.post('/api/outlets/illustrative');
-    expect(r.status).toBe(201);
-    expect(r.body.isIllustrative).toBe(true);
-    expect((await c.get(`/api/outlets/${real}/ingredients`)).body.items).toHaveLength(0);
-    const run = (await c.post(`/api/outlets/${r.body.id}/recommendations/run`, {})).body;
-    const kinds = new Set(run.items.map((i: { kind: string }) => i.kind));
-    expect(kinds.has('unsafe_stock')).toBe(true);
-    expect(kinds.has('verify_best_before')).toBe(true);
-    expect(kinds.has('data_gap')).toBe(true);
-    void NOW;
   });
 });
 

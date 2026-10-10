@@ -28,7 +28,7 @@ async function noHorizontalOverflow(page: Page) {
 }
 
 async function login(page: Page) {
-  await page.goto('/');
+  await page.goto('/app');
   await page.getByLabel('Username').fill(OWNER.username);
   await page.getByLabel('Password').fill(OWNER.password);
   await page.getByRole('button', { name: 'Sign in' }).click();
@@ -39,7 +39,7 @@ test.describe.serial('CulinAction core workflow', () => {
   let outletPath = '';
 
   test('onboarding: owner setup with validation, then outlet creation', async ({ page }) => {
-    await page.goto('/');
+    await page.goto('/app');
     await expect(page.getByRole('heading', { name: 'Create the owner account' })).toBeVisible();
     await page.getByRole('button', { name: 'Create account' }).click();
     await expect(page.getByText('Please fix the highlighted fields.')).toBeVisible();
@@ -171,11 +171,9 @@ test.describe.serial('CulinAction core workflow', () => {
     await rec.click();
 
     await expect(page.getByText('Why this recommendation? — the calculation')).toBeVisible();
-    await expect(page.getByText(/Veg Biryani: forecast 30 portions × 200 g/)).toBeVisible();
+    await expect(page.getByText(/Veg Biryani: forecast 30 portions × 200 g/).first()).toBeVisible();
     await expect(page.getByText('What information is missing?')).toBeVisible();
-    await expect(
-      page.getByText('AI explanation is not configured on this server.', { exact: false }),
-    ).toBeVisible();
+    await expect(page.getByText(/AI explanation is not configured on this server/)).toBeVisible();
     await page.screenshot({ path: `${SHOTS}/04-evidence-desktop.png`, fullPage: true });
 
     await page.getByRole('radio', { name: /Cap preparation to usable stock/ }).click();
@@ -242,14 +240,14 @@ test.describe.serial('CulinAction core workflow', () => {
       await login(page);
       await page.goto(`${outletPath}/today`);
       const nav = page.getByRole('navigation', { name: 'Main' }).last();
-      await expect(nav.getByRole('link', { name: 'Stock' })).toBeVisible();
-      await nav.getByRole('link', { name: 'Stock' }).click();
-      await expect(page.getByRole('heading', { name: 'Inventory' })).toBeVisible();
+      await expect(nav.getByRole('link', { name: 'Orders' })).toBeVisible();
+      await nav.getByRole('link', { name: 'Orders' }).click();
+      await expect(page.getByRole('heading', { name: 'Orders & delivery risk' })).toBeVisible();
       await nav.getByRole('button', { name: 'More' }).click();
       await expect(page.getByRole('dialog', { name: 'All sections' })).toBeVisible();
       await page
         .getByRole('dialog', { name: 'All sections' })
-        .getByRole('link', { name: 'Analytics' })
+        .getByRole('link', { name: 'Analytics & reports' })
         .click();
       await expect(page.getByRole('heading', { name: 'Analytics & outcomes' })).toBeVisible();
 
@@ -267,6 +265,11 @@ test.describe.serial('CulinAction core workflow', () => {
         'analytics',
         'settings',
         'movements',
+        'orders',
+        'orders/import',
+        'whatif',
+        'approvals',
+        'verify',
       ];
       for (const p of pages) {
         await page.goto(`${outletPath}/${p}`);
@@ -280,16 +283,4 @@ test.describe.serial('CulinAction core workflow', () => {
       expect(box!.height).toBeGreaterThanOrEqual(44);
     });
   }
-
-  test('illustrative workspace is labelled on every page', async ({ page }) => {
-    await login(page);
-    await page.goto('/');
-    await page.getByRole('button', { name: 'Create illustrative workspace' }).click();
-    await expect(page.getByText(/Illustrative workspace — every record here is synthetic/)).toBeVisible();
-    await page.getByRole('link', { name: 'Recommendations' }).first().click();
-    await expect(page.getByText(/Illustrative workspace — every record here is synthetic/)).toBeVisible();
-    await page.getByRole('button', { name: 'Run decision engine' }).click();
-    await expect(page.getByText('Food safety').first()).toBeVisible();
-    await page.screenshot({ path: `${SHOTS}/06-illustrative-recommendations.png`, fullPage: true });
-  });
 });

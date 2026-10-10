@@ -1,7 +1,9 @@
 // Deterministic decision engine. Pure function of a Snapshot — no I/O, no randomness,
 // no clock reads (dates come from the snapshot). See docs/ARCHITECTURE.md.
 
-import { addDays, formatDate } from './dates';
+import { addDays, formatDate, formatDateTime } from './dates';
+import { assessDeliveryRisk, RISK_LABELS, type RiskResult } from './deliveryRisk';
+import { EVENT_LABELS, durations, isOpen, orderStage, preparedButUndelivered, STAGE_LABELS } from './orders';
 import {
   buildSalesIndex,
   dateRange,
@@ -20,6 +22,8 @@ import type {
   EvidenceSales,
   IngredientSnap,
   MenuItemSnap,
+  OrderSnap,
+  OutcomeSnap,
   PlanLineDraft,
   RecOption,
   Recommendation,
@@ -59,6 +63,12 @@ export interface EngineResult {
     usableQty: number;
     excludedQty: number;
     unitCostPaise: number | null;
+  }[];
+  orderRisks: {
+    orderId: number;
+    level: RiskResult['level'];
+    factors: RiskResult['factors'];
+    missing: string[];
   }[];
   summary: {
     byTier: Record<string, number>;
@@ -644,7 +654,22 @@ function expiryWasteRisk(ctx: Ctx, out: Recommendation[]) {
         estimatedCostPaise: null,
       }));
 
+      // Using a dated batch requires the operator to confirm it has been stored as required.
+      if (!batch.storageVerifiedOn && prepLines.length) {
+        prepLines.unshift({
+          type: 'verify',
+          subjectType: 'batch',
+          subjectId: batch.id,
+          subjectName: lotName,
+          qty: null,
+          unit: null,
+          note: 'Confirm this lot has been stored as required (temperature, cover, handling) before using it. If not, discard it.',
+          estimatedCostPaise: null,
+        });
+      }
       const missing: string[] = [];
+      if (!batch.storageVerifiedOn)
+        missing.push(`Storage check for ${lotName} (not yet confirmed by an operator)`);
       if (!users.length)
         missing.push(`No verified recipe uses ${ing.name}, so expected use cannot be calculated.`);
       for (const n of unknownItems) missing.push(`Sales history for ${n} (uses ${ing.name})`);
@@ -780,10 +805,25 @@ function prepAdjustment(ctx: Ctx, out: Recommendation[]) {
   for (const m of ctx.verifiedItems) {
     const f = ctx.fc(m.id, planDate);
     if (f.method === 'insufficient') continue;
-    const outs = ctx.snap.outcomes
-      .filter((o) => o.menuItemId === m.id && o.date >= from && o.date < planDate)
-      .sort((a, b) => (a.date < b.date ? 1 : -1))
-      .slice(0, 7);
+    // Forecasts are per day, so service-period outcomes are summed per day before comparing.
+    const byDate = new Map<string, OutcomeSnap>();
+    for (const o of ctx.snap.outcomes) {
+      if (o.menuItemId !== m.id || o.date < from || o.date >= planDate) continue;
+      const d = byDate.get(o.date);
+      byDate.set(
+        o.date,
+        d
+          ? {
+              ...d,
+              prepared: d.prepared + o.prepared,
+              sold: d.sold + o.sold,
+              remaining: d.remaining + o.remaining,
+              discarded: d.discarded + o.discarded,
+            }
+          : { ...o },
+      );
+    }
+    const outs = [...byDate.values()].sort((a, b) => (a.date < b.date ? 1 : -1)).slice(0, 7);
     if (outs.length < 3) continue;
     const n = outs.length;
     const avgPrep = n2(outs.reduce((a, o) => a + o.prepared, 0) / n);
@@ -878,7 +918,7 @@ function prepAdjustment(ctx: Ctx, out: Recommendation[]) {
         sales: [ctx.evSales(m, f)],
         other: outs.map(
           (o) =>
-            `${formatDate(o.date)}: prepared ${o.prepared}, sold ${o.sold}, remaining ${o.remaining}, discarded ${o.discarded}`,
+            `${formatDate(o.date)}: prepared ${o.prepared}, sold ${o.sold}, kept or transferred ${o.remaining}, discarded ${o.discarded}`,
         ),
       },
       calculation: [
@@ -893,6 +933,7 @@ function prepAdjustment(ctx: Ctx, out: Recommendation[]) {
       ].filter(Boolean),
       assumptions: [
         'Recorded outcomes reflect normal service.',
+        'Outcomes for a day are summed across service periods and compared with the whole-day forecast.',
         'Leftovers are not reliably sold on later days.',
       ],
       options: [
@@ -1241,6 +1282,376 @@ function dataGaps(ctx: Ctx, out: Recommendation[]) {
 }
 
 // ---------------------------------------------------------------------------
+// Delivery and order generators
+// ---------------------------------------------------------------------------
+
+function orderItemsInfo(ctx: Ctx, o: OrderSnap) {
+  const byId = new Map(ctx.snap.menuItems.map((m) => [m.id, m]));
+  return o.items.map((it) => {
+    const m = byId.get(it.menuItemId);
+    return {
+      qty: it.qty,
+      menuItemId: it.menuItemId,
+      name: m?.name ?? `#${it.menuItemId}`,
+      handlingClass: m?.handlingClass ?? null,
+      maxHoldMin: m?.handlingMaxHoldMin ?? null,
+      handlingVerified: !!m?.handlingVerified,
+      cpp: ctx.costPerPortion(it.menuItemId),
+    };
+  });
+}
+
+function riskSettings(ctx: Ctx) {
+  const st = ctx.snap.settings;
+  return {
+    prepWarnMin: st.prepWarnMin ?? 25,
+    readyWaitWarnMin: st.readyWaitWarnMin ?? 10,
+    readyWaitHighMin: st.readyWaitHighMin ?? 20,
+    deliveryTargetMin: st.deliveryTargetMin ?? 45,
+  };
+}
+
+function assessOrder(ctx: Ctx, o: OrderSnap): RiskResult {
+  const items = orderItemsInfo(ctx, o);
+  return assessDeliveryRisk({
+    status: o.status,
+    events: o.events,
+    items: items.map((i) => ({
+      name: i.name,
+      handlingClass: i.handlingClass,
+      maxHoldMin: i.maxHoldMin,
+      handlingVerified: i.handlingVerified,
+    })),
+    estTravelMin: o.estTravelMin,
+    packaging: o.packaging,
+    delayReason: o.delayReason,
+    settings: riskSettings(ctx),
+    nowIso: ctx.snap.nowIso,
+  });
+}
+
+function timeline(o: OrderSnap): string[] {
+  return o.events.map(
+    (e) => `${formatDateTime(e.at)} — ${EVENT_LABELS[e.type]}${e.reason ? ` (${e.reason})` : ''}`,
+  );
+}
+
+function pickupDelay(ctx: Ctx, out: Recommendation[], risks: Map<number, RiskResult>) {
+  for (const o of ctx.snap.orders ?? []) {
+    if (!['prepared', 'packing', 'packed', 'ready_for_pickup', 'picked_up', 'in_transit'].includes(o.status))
+      continue;
+    const r = risks.get(o.id)!;
+    if (r.level !== 'moderate' && r.level !== 'high') continue;
+    const exceedsLimit = r.limitMin !== null && (r.projectedHoldMin ?? r.holdMin ?? 0) > r.limitMin;
+    const waiting = o.status === 'ready_for_pickup' || o.status === 'packed';
+    const line = (note: string): PlanLineDraft => ({
+      type: 'order_action',
+      subjectType: 'order',
+      subjectId: o.id,
+      subjectName: `Order ${o.ref}`,
+      qty: null,
+      unit: null,
+      note,
+      estimatedCostPaise: null,
+    });
+    const options: RecOption[] = [
+      {
+        key: 'A',
+        label: waiting ? 'Alert staff and chase the pickup' : 'Contact the rider for an update',
+        description: waiting
+          ? 'Tell the counter team, contact the rider or delivery platform through your usual channel, and record what happened. Nothing is sent automatically.'
+          : 'Ask the rider for an arrival estimate through your usual channel and record it. Nothing is sent automatically.',
+        feasible: true,
+        effects: [{ label: 'Current level', value: RISK_LABELS[r.level] }],
+        estimatedCostPaise: null,
+        lines: [
+          line(
+            waiting
+              ? 'Alert staff; contact rider/platform; record pickup time'
+              : 'Contact rider; record expected arrival',
+          ),
+        ],
+      },
+      {
+        key: 'B',
+        label: 'Record the delay reason',
+        description: 'Capture why this order is delayed so recurring causes can be analysed later.',
+        feasible: true,
+        effects: [{ label: 'Delay reason on file', value: o.delayReason ?? 'Not yet recorded' }],
+        estimatedCostPaise: null,
+        lines: [line('Record the delay reason on the order')],
+      },
+    ];
+    if (exceedsLimit) {
+      options.unshift({
+        key: 'C',
+        label: 'Manager review before hand-over',
+        description: `Recorded times exceed the verified handling limit (${r.limitMin} min). A manager decides per your food-safety procedure whether the order can still be handed over or must be remade. CulinAction does not make this decision.`,
+        feasible: true,
+        effects: [
+          {
+            label: 'Time since preparation',
+            value: `${r.holdMin} min${r.projectedHoldMin !== null ? ` (≈ ${r.projectedHoldMin} at delivery)` : ''}`,
+          },
+        ],
+        estimatedCostPaise: null,
+        lines: [
+          line(`Manager review: handling limit ${r.limitMin} min exceeded — follow food-safety procedure`),
+        ],
+      });
+    }
+    out.push({
+      key: `pickup_delay:${o.id}`,
+      kind: 'pickup_delay',
+      severityTier: exceedsLimit ? 1 : 2,
+      title: `Order ${o.ref}: ${RISK_LABELS[r.level].toLowerCase()} — ${
+        o.status === 'ready_for_pickup'
+          ? `waiting ${r.readyWaitMin} min for pickup`
+          : `${o.status.replace(/_/g, ' ')}`
+      }`,
+      problem: r.summary,
+      subjectName: `Order ${o.ref}`,
+      evidence: {
+        batches: [],
+        recipes: [],
+        sales: [],
+        other: [...timeline(o), ...r.factors.map((f) => `${f.factor}: ${f.value} — ${f.note}`)],
+      },
+      calculation: r.factors.map((f) => `${f.factor}: ${f.value}. ${f.note}`),
+      assumptions: [
+        'Times are taken from the recorded order events; missing events are not estimated.',
+        'Travel time is the recorded estimate, not live traffic or GPS data.',
+      ],
+      options,
+      confidence: r.missing.length ? 'medium' : 'high',
+      missingInfo: r.missing,
+      safetyChecks: [
+        'CulinAction does not measure food temperature; it compares recorded times with limits your outlet verified.',
+        'No order is dispatched, cancelled or changed automatically.',
+      ],
+      nextStep: exceedsLimit
+        ? 'Get a manager decision before this order is handed over.'
+        : 'Chase the pickup now and record what happened.',
+      estimatedImpactPaise: null,
+      impactLabel: '',
+      sortKey: `pickup_delay:${o.placedAt}:${o.ref}`,
+    });
+  }
+}
+
+function orderDisposition(ctx: Ctx, out: Recommendation[]) {
+  const nowMs = Date.parse(ctx.snap.nowIso);
+  for (const o of ctx.snap.orders ?? []) {
+    if (!['cancelled', 'uncollected', 'returned'].includes(o.status) || o.disposition) continue;
+    if (!preparedButUndelivered(o.events, o.status)) continue;
+    const stage = orderStage(o.events, o.status);
+    const items = orderItemsInfo(ctx, o);
+    const costKnown = items.length > 0 && items.every((i) => i.cpp !== null);
+    const cost = costKnown ? Math.round(items.reduce((a, i) => a + i.qty * i.cpp!, 0)) : null;
+    const prepDone = o.events.find((e) => e.type === 'prep_completed')?.at ?? null;
+    const reason =
+      o.status === 'returned'
+        ? 'returned'
+        : o.status === 'uncollected'
+          ? 'uncollected order'
+          : 'cancelled order';
+    const allVerified = items.length > 0 && items.every((i) => i.handlingVerified && i.maxHoldMin);
+    const limit = allVerified ? Math.min(...items.map((i) => i.maxHoldMin!)) : null;
+    const holdUntil = prepDone && limit !== null ? new Date(Date.parse(prepDone) + limit * 60_000) : null;
+    const holdOk = o.status !== 'returned' && holdUntil !== null && holdUntil.getTime() > nowMs;
+    const holdReason =
+      o.status === 'returned'
+        ? 'Customer-returned food is never served to another customer.'
+        : !allVerified
+          ? 'Verified handling limits are not recorded for every item.'
+          : !prepDone
+            ? 'Preparation completed time is not recorded.'
+            : 'The verified handling limit has already passed.';
+    const totalPortions = items.reduce((a, i) => a + i.qty, 0);
+    const options: RecOption[] = [
+      {
+        key: 'A',
+        label: 'Record disposal as waste',
+        description:
+          'Dispose of the prepared food per your procedure and record it, so the cost appears in waste analytics. Closes the order.',
+        feasible: true,
+        effects: [
+          {
+            label: 'Estimated ingredient cost of the food',
+            value: cost === null ? 'Unknown — ingredient cost missing' : formatINR(cost),
+          },
+        ],
+        estimatedCostPaise: cost,
+        lines: [
+          {
+            type: 'dispose_order',
+            subjectType: 'order',
+            subjectId: o.id,
+            subjectName: `Order ${o.ref}`,
+            qty: totalPortions,
+            unit: 'portions',
+            note: `Record disposal (reason: ${reason})`,
+            estimatedCostPaise: cost,
+          },
+        ],
+      },
+    ];
+    if (o.status !== 'returned') {
+      options.push({
+        key: 'B',
+        label: holdUntil
+          ? `Hold for re-collection until ${formatDateTime(holdUntil.toISOString())}`
+          : 'Hold for re-collection',
+        description:
+          'Keep the order only within the verified handling limit in case the customer or rider returns; if not collected by then, record disposal. Resale or donation is not suggested.',
+        feasible: holdOk,
+        infeasibleReason: holdOk ? undefined : holdReason,
+        effects: [
+          {
+            label: 'Verified handling limit',
+            value: limit === null ? 'Not verified' : `${limit} min after preparation`,
+          },
+        ],
+        estimatedCostPaise: null,
+        lines: [
+          {
+            type: 'order_action',
+            subjectType: 'order',
+            subjectId: o.id,
+            subjectName: `Order ${o.ref}`,
+            qty: null,
+            unit: null,
+            note: `Hold per verified rule until ${holdUntil ? formatDateTime(holdUntil.toISOString()) : '—'}; then record disposal if not collected`,
+            estimatedCostPaise: null,
+          },
+        ],
+      });
+    }
+    out.push({
+      key: `order_disposition:${o.id}`,
+      kind: 'order_disposition',
+      severityTier: 2,
+      title: `Order ${o.ref}: ${STAGE_LABELS[stage].toLowerCase()} — record what happens to the food`,
+      problem: `Order ${o.ref} (${items.map((i) => `${i.qty} × ${i.name}`).join(', ')}) was prepared but did not reach the customer (${STAGE_LABELS[stage].toLowerCase()}). The food needs a recorded disposition.`,
+      subjectName: `Order ${o.ref}`,
+      evidence: { batches: [], recipes: [], sales: [], other: timeline(o) },
+      calculation: [
+        cost === null
+          ? 'Ingredient cost of the prepared food: unknown (a recipe or cost is missing).'
+          : `Ingredient cost = Σ portions × recipe cost per portion = ${formatINR(cost)} (estimate)`,
+        ...(holdUntil
+          ? [`Hold limit = preparation completed + ${limit} min = ${formatDateTime(holdUntil.toISOString())}`]
+          : []),
+      ],
+      assumptions: ['The food has not been handed to anyone since the last recorded event.'],
+      options,
+      confidence: costKnown ? 'high' : 'medium',
+      missingInfo: [
+        ...(costKnown ? [] : ['Recipe cost for one or more items']),
+        ...(allVerified ? [] : ['Verified handling limit for every item']),
+      ],
+      safetyChecks: [
+        'CulinAction never assumes cancelled or uncollected food can be resold, reused or donated.',
+        'Customer-returned food is never offered to another customer.',
+      ],
+      nextStep: 'Choose a disposition and add it to a plan; completing the task records the result.',
+      estimatedImpactPaise: cost,
+      impactLabel: 'Estimated ingredient cost of the prepared food',
+      sortKey: `order_disposition:${o.placedAt}:${o.ref}`,
+    });
+  }
+}
+
+function median(xs: number[]): number | null {
+  const a = [...xs].sort((x, y) => x - y);
+  if (!a.length) return null;
+  return a.length % 2 ? a[(a.length - 1) / 2] : (a[a.length / 2 - 1] + a[a.length / 2]) / 2;
+}
+
+function prepBottleneck(ctx: Ctx, out: Recommendation[]) {
+  const st = riskSettings(ctx);
+  const nowMs = Date.parse(ctx.snap.nowIso);
+  const recent = (ctx.snap.orders ?? []).filter((o) => nowMs - Date.parse(o.placedAt) <= 14 * 86400000);
+  const ds = recent.map((o) => durations(o.events, o.status, ctx.snap.nowIso));
+  const prep = ds.map((d) => d.prepMin).filter((x): x is number => x !== null);
+  const wait = ds.filter((d) => d.readyWaitMin !== null && !d.readyWaitOngoing).map((d) => d.readyWaitMin!);
+  const mp = prep.length >= 5 ? median(prep) : null;
+  const mw = wait.length >= 5 ? median(wait) : null;
+  const slowPrep = mp !== null && mp > st.prepWarnMin;
+  const slowWait = mw !== null && mw >= st.readyWaitWarnMin;
+  if (!slowPrep && !slowWait) return;
+  const verifyLine = (note: string): PlanLineDraft => ({
+    type: 'verify',
+    subjectType: 'outlet',
+    subjectId: 0,
+    subjectName: 'Kitchen flow',
+    qty: null,
+    unit: null,
+    note,
+    estimatedCostPaise: null,
+  });
+  out.push({
+    key: 'prep_bottleneck',
+    kind: 'prep_bottleneck',
+    severityTier: 3,
+    title: slowPrep
+      ? `Preparation takes ${mp} min (median) — above the ${st.prepWarnMin}-min guideline`
+      : `Orders wait ${mw} min (median) for pickup`,
+    problem:
+      'Recorded order timelines over the last 14 days show a recurring delay. Recurring delays increase how long food is held before it reaches customers.',
+    subjectName: 'Kitchen flow',
+    evidence: {
+      batches: [],
+      recipes: [],
+      sales: [],
+      other: [
+        `${prep.length} orders with preparation start and end recorded`,
+        `${wait.length} orders with ready and pickup times recorded`,
+      ],
+    },
+    calculation: [
+      mp === null
+        ? 'Median preparation time: not enough orders (need 5)'
+        : `Median preparation time = ${mp} min over ${prep.length} orders (guideline ${st.prepWarnMin} min)`,
+      mw === null
+        ? 'Median wait for pickup: not enough orders (need 5)'
+        : `Median wait for pickup = ${mw} min over ${wait.length} orders (warning ${st.readyWaitWarnMin} min)`,
+    ],
+    assumptions: ['Only orders with both timestamps recorded are included.'],
+    options: [
+      {
+        key: 'A',
+        label: 'Investigate the bottleneck',
+        description:
+          'Review the slowest orders and the stations involved; adjust staffing or batch timing. Record findings.',
+        feasible: true,
+        effects: [],
+        estimatedCostPaise: null,
+        lines: [verifyLine('Review slow orders and stations; record findings')],
+      },
+      {
+        key: 'B',
+        label: 'Record delay reasons for a week',
+        description: 'Ask staff to record a reason for every delayed order so the cause can be measured.',
+        feasible: true,
+        effects: [],
+        estimatedCostPaise: null,
+        lines: [verifyLine('Record a delay reason on every delayed order for 7 days')],
+      },
+    ],
+    confidence: prep.length >= 20 || wait.length >= 20 ? 'high' : 'medium',
+    missingInfo: [],
+    safetyChecks: [],
+    nextStep: 'Review the slowest orders in the Delivery workspace.',
+    estimatedImpactPaise: null,
+    impactLabel: '',
+    sortKey: 'prep_bottleneck',
+  });
+}
+
+export { assessOrder };
+
+// ---------------------------------------------------------------------------
 // Ranking and entry point
 // ---------------------------------------------------------------------------
 
@@ -1270,6 +1681,11 @@ export function runEngine(snap: Snapshot): EngineResult {
   excessStock(ctx, recs);
   forecastDeviation(ctx, recs);
   dataGaps(ctx, recs);
+  const orderRisks = new Map<number, RiskResult>();
+  for (const o of snap.orders ?? []) orderRisks.set(o.id, assessOrder(ctx, o));
+  pickupDelay(ctx, recs, orderRisks);
+  orderDisposition(ctx, recs);
+  prepBottleneck(ctx, recs);
   recs.sort(compareRecommendations);
 
   const forecasts = ctx.verifiedItems.map((m) => ctx.fc(m.id, snap.planDate));
@@ -1292,11 +1708,99 @@ export function runEngine(snap: Snapshot): EngineResult {
       excludedQty: s.excludedQty,
       unitCostPaise: s.unitCostPaise,
     })),
+    orderRisks: [...orderRisks.entries()]
+      .filter(([id]) => isOpen((snap.orders ?? []).find((o) => o.id === id)!.status))
+      .map(([orderId, r]) => ({ orderId, level: r.level, factors: r.factors, missing: r.missing })),
     summary: {
       byTier,
       excludedBatches,
       verifiedItems: ctx.verifiedItems.length,
       itemsWithForecast: forecasts.filter((f) => f.method !== 'insufficient').length,
     },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Helpers for API views (same logic as the engine, no duplication)
+// ---------------------------------------------------------------------------
+
+/** Risk assessment for every order in the snapshot. */
+export function assessOrders(snap: Snapshot): Map<number, RiskResult> {
+  const ctx = new Ctx(snap);
+  const out = new Map<number, RiskResult>();
+  for (const o of snap.orders ?? []) out.set(o.id, assessOrder(ctx, o));
+  return out;
+}
+
+export type PrepInputs =
+  | { ok: false; reason: string }
+  | {
+      ok: true;
+      item: MenuItemSnap;
+      forecast: Forecast;
+      ingredients: import('./whatIf').PrepIngredientInput[];
+    };
+
+/** Inputs for the preparation what-if: verified recipe, usable stock, other dishes' forecast demand. */
+export function prepInputs(snap: Snapshot, menuItemId: number): PrepInputs {
+  const ctx = new Ctx(snap);
+  const item = ctx.verifiedItems.find((m) => m.id === menuItemId);
+  if (!item) {
+    const any = snap.menuItems.find((m) => m.id === menuItemId);
+    return {
+      ok: false,
+      reason: any
+        ? `${any.name} has no verified, valid recipe, so its ingredient use cannot be calculated.`
+        : 'Menu item not found.',
+    };
+  }
+  const per = ctx.perServing.get(item.id)!;
+  const ingredients = [...per.entries()].map(([ingId, perPortion]) => {
+    const st = ctx.st(ingId);
+    const otherDemand = ctx
+      .usersOf(ingId)
+      .filter((m) => m.id !== item.id)
+      .reduce((a, m) => {
+        const f = ctx.fc(m.id, snap.planDate);
+        return a + (f.method === 'insufficient' ? 0 : f.mean! * ctx.per(m.id, ingId));
+      }, 0);
+    return {
+      ingredientId: ingId,
+      name: st.ingredient.name,
+      baseUnit: st.ingredient.baseUnit,
+      perPortion,
+      usableQty: st.usableQty,
+      otherDemand: roundQty(otherDemand),
+      unitCostPaise: st.unitCostPaise,
+    };
+  });
+  return { ok: true, item, forecast: ctx.fc(item.id, snap.planDate), ingredients };
+}
+
+/** Forecast daily use of an ingredient across verified dishes (null when no dish has enough history). */
+export function dailyUseOf(
+  snap: Snapshot,
+  ingredientId: number,
+): {
+  dailyUse: number | null;
+  usableQty: number;
+  unitCostPaise: number | null;
+  baseUnit: string;
+  name: string;
+} | null {
+  const ctx = new Ctx(snap);
+  const st = ctx.state.get(ingredientId);
+  if (!st) return null;
+  const users = ctx.usersOf(ingredientId).map((m) => ({ m, f: ctx.fc(m.id, snap.planDate) }));
+  const known = users.filter((x) => x.f.method !== 'insufficient');
+  const dailyUse = known.length
+    ? roundQty(known.reduce((a, { m, f }) => a + f.mean! * ctx.per(m.id, ingredientId), 0))
+    : null;
+  return {
+    dailyUse,
+    usableQty: st.usableQty,
+    unitCostPaise: st.unitCostPaise,
+    baseUnit: st.ingredient.baseUnit,
+    name: st.ingredient.name,
   };
 }

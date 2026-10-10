@@ -1,7 +1,8 @@
 import { todayInTz } from '../shared/dates';
 import { costOf } from '../shared/money';
 import { batchSafety, fifoCompare } from '../shared/safety';
-import type { BatchSnap, DateType, IngredientSnap, MenuItemSnap, Snapshot } from '../shared/types';
+import type { OrderEventType, OrderStatus } from '../shared/orders';
+import type { BatchSnap, DateType, IngredientSnap, MenuItemSnap, OrderSnap, Snapshot } from '../shared/types';
 import { roundQty, type BaseUnit } from '../shared/units';
 import type { OutletRow } from './auth';
 import type { Db } from './db/database';
@@ -74,6 +75,7 @@ export interface BatchRow {
   date_value: string | null;
   quarantined: number;
   quality_checked_on: string | null;
+  storage_verified_on?: string | null;
   source: string;
   created_at: string;
   updated_at: string;
@@ -89,6 +91,7 @@ export const batchToSnap = (b: BatchRow): BatchSnap => ({
   dateValue: b.date_value,
   quarantined: !!b.quarantined,
   qualityCheckedOn: b.quality_checked_on,
+  storageVerifiedOn: b.storage_verified_on ?? null,
 });
 
 export async function getIngredient(db: Db, outletId: number, id: number): Promise<IngredientRow> {
@@ -396,6 +399,9 @@ export async function loadMenuSnaps(db: Db, outletId: number): Promise<MenuItemS
     active: number;
     allergens: string | null;
     allergens_verified: number;
+    handling_class: 'hot' | 'cold' | 'ambient' | 'frozen' | null;
+    handling_max_hold_min: number | null;
+    handling_verified: number;
     verified: number | null;
   }>(
     `SELECT m.*, r.verified FROM menu_items m LEFT JOIN recipes r ON r.menu_item_id = m.id WHERE m.outlet_id = ? ORDER BY m.name`,
@@ -421,6 +427,9 @@ export async function loadMenuSnaps(db: Db, outletId: number): Promise<MenuItemS
     recipeVerified: !!m.verified,
     allergens: m.allergens,
     allergensVerified: !!m.allergens_verified,
+    handlingClass: m.handling_class,
+    handlingMaxHoldMin: m.handling_max_hold_min,
+    handlingVerified: !!m.handling_verified,
     lines: lines
       .filter((l) => l.menu_item_id === m.id)
       .map((l) => ({ ingredientId: l.ingredient_id, qty: l.qty, unit: l.unit, lossPct: l.loss_pct })),
@@ -463,7 +472,12 @@ export async function loadSnapshot(
       excessCoverDays: outlet.excess_cover_days,
       staleCountDays: outlet.stale_count_days,
       purchaseBufferPct: outlet.purchase_buffer_pct,
+      prepWarnMin: outlet.prep_warn_min,
+      readyWaitWarnMin: outlet.ready_wait_warn_min,
+      readyWaitHighMin: outlet.ready_wait_high_min,
+      deliveryTargetMin: outlet.delivery_target_min,
     },
+    orders: await loadOrderSnaps(db, outlet.id, now),
     ingredients: await loadIngredientSnaps(db, outlet.id),
     menuItems: await loadMenuSnaps(db, outlet.id),
     sales: (
@@ -481,6 +495,7 @@ export async function loadSnapshot(
         qty_sold: number;
         qty_remaining: number;
         qty_discarded: number;
+        qty_transferred: number;
       }>('SELECT * FROM service_outcomes WHERE outlet_id = ? AND business_date >= ?', [outlet.id, from])
     ).map((o) => ({
       id: o.id,
@@ -488,7 +503,7 @@ export async function loadSnapshot(
       menuItemId: o.menu_item_id,
       prepared: o.qty_prepared,
       sold: o.qty_sold,
-      remaining: o.qty_remaining,
+      remaining: o.qty_remaining + (o.qty_transferred ?? 0),
       discarded: o.qty_discarded,
     })),
     // latest stored forecast per (date, item), last 14 days
@@ -501,4 +516,96 @@ export async function loadSnapshot(
       )
     ).map((f) => ({ date: f.target_date, menuItemId: f.menu_item_id, mean: f.forecast_mean })),
   };
+}
+
+/**
+ * Multi-row INSERT in chunks — one round trip per chunk, which matters on remote libSQL/Turso.
+ * Returns nothing; use for rows whose ids are not needed.
+ */
+export async function insertMany(db: Db, table: string, cols: string[], rows: unknown[][], chunk = 300) {
+  for (let i = 0; i < rows.length; i += chunk) {
+    const part = rows.slice(i, i + chunk);
+    const ph = `(${cols.map(() => '?').join(',')})`;
+    await db.run(
+      `INSERT INTO ${table} (${cols.join(', ')}) VALUES ${part.map(() => ph).join(', ')}`,
+      part.flat() as never,
+    );
+  }
+}
+
+/** Multi-row INSERT … RETURNING id, <keyCol>; returns key → id. */
+export async function insertReturning(
+  db: Db,
+  table: string,
+  cols: string[],
+  rows: unknown[][],
+  keyCol: string,
+): Promise<Map<string, number>> {
+  const out = new Map<string, number>();
+  for (let i = 0; i < rows.length; i += 300) {
+    const part = rows.slice(i, i + 300);
+    const ph = `(${cols.map(() => '?').join(',')})`;
+    const res = await db.all<Record<string, unknown>>(
+      `INSERT INTO ${table} (${cols.join(', ')}) VALUES ${part.map(() => ph).join(', ')} RETURNING id, ${keyCol} AS k`,
+      part.flat() as never,
+    );
+    for (const r of res) out.set(String(r.k), Number(r.id));
+  }
+  return out;
+}
+
+/** Open orders plus orders placed in the last 14 days, with items and events (time-ordered). */
+export async function loadOrderSnaps(
+  db: Db,
+  outletId: number,
+  now: Date,
+  orderId?: number,
+): Promise<OrderSnap[]> {
+  const since = new Date(now.getTime() - 14 * 86400000).toISOString();
+  const where = orderId
+    ? 'o.outlet_id = ? AND o.id = ?'
+    : "o.outlet_id = ? AND (o.placed_at >= ? OR o.status NOT IN ('delivered','closed'))";
+  const params = orderId ? [outletId, orderId] : [outletId, since];
+  const orders = await db.all<{
+    id: number;
+    order_ref: string;
+    channel: string;
+    status: OrderStatus;
+    placed_at: string;
+    est_travel_min: number | null;
+    packaging: string | null;
+    delay_reason: string | null;
+    disposition: string | null;
+  }>(`SELECT o.* FROM orders o WHERE ${where} ORDER BY o.placed_at`, params);
+  if (!orders.length) return [];
+  const ids = orders.map((o) => o.id);
+  const ph = ids.map(() => '?').join(',');
+  const items = await db.all<{ order_id: number; menu_item_id: number; qty: number }>(
+    `SELECT order_id, menu_item_id, qty FROM order_items WHERE order_id IN (${ph})`,
+    ids,
+  );
+  const events = await db.all<{
+    order_id: number;
+    event_type: OrderEventType;
+    occurred_at: string;
+    reason: string | null;
+  }>(
+    `SELECT order_id, event_type, occurred_at, reason FROM order_events WHERE order_id IN (${ph}) ORDER BY occurred_at, id`,
+    ids,
+  );
+  return orders.map((o) => ({
+    id: o.id,
+    ref: o.order_ref,
+    channel: o.channel,
+    status: o.status,
+    placedAt: o.placed_at,
+    estTravelMin: o.est_travel_min,
+    packaging: o.packaging,
+    delayReason: o.delay_reason,
+    disposition: o.disposition,
+    items: items.filter((i) => i.order_id === o.id).map((i) => ({ menuItemId: i.menu_item_id, qty: i.qty })),
+    events: events
+      .filter((e) => e.order_id === o.id)
+      .map((e) => ({ type: e.event_type, at: e.occurred_at, reason: e.reason })),
+  }));
 }

@@ -15,7 +15,7 @@ interface AnalyticsDto {
     entriesWithoutCost: number;
     discardedPortions: number;
     byDay: { date: string; recorded: number; estimated: number }[];
-    byReason: { reason: string; count: number }[];
+    byReason: { reason: string; count: number; recorded: number; estimated: number; unknown: number }[];
   };
   sales: { portionsSold: number; days: number; byDay: { date: string; portions: number }[] };
   wastePer100Portions: { value: number | null; discardedPortions: number; portionsSold: number };
@@ -30,6 +30,16 @@ interface AnalyticsDto {
     totalPaise: number | null;
     recommendations: number;
     withoutEstimate: number;
+  };
+  delivery: {
+    orders: number;
+    note: string;
+    medianPrepMin: number | null;
+    medianReadyWaitMin: number | null;
+    medianDeliveryMin: number | null;
+    waitedOverWarning: number;
+    withWaitRecorded: number;
+    cancelledOrUncollected: number;
   };
   prepComparisons: {
     taskId: number;
@@ -340,14 +350,83 @@ export function Analytics() {
                         .join(' · ')
                     : 'none in this period'}
                 </div>
-                <div>
-                  <strong>Waste entries by reason:</strong>{' '}
-                  {a.waste.byReason.length
-                    ? a.waste.byReason
-                        .map((r) => `${WASTE_REASON_LABELS[r.reason] ?? r.reason} (${r.count})`)
-                        .join(' · ')
-                    : 'none'}
+              </div>
+            </Card>
+          </div>
+          <div className="grid-2">
+            <Card title="Waste by category">
+              {!a.waste.byReason.length ? (
+                <div className="card-body small muted">No waste recorded in this period.</div>
+              ) : (
+                <div className="table-wrap">
+                  <table className="table">
+                    <thead>
+                      <tr>
+                        <th>Category</th>
+                        <th className="num">Entries</th>
+                        <th className="num">Recorded cost</th>
+                        <th className="num">Estimated cost</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {a.waste.byReason.map((r) => (
+                        <tr key={r.reason}>
+                          <td>{WASTE_REASON_LABELS[r.reason] ?? r.reason}</td>
+                          <td className="num">{r.count}</td>
+                          <td className="num">{r.recorded ? formatINR(r.recorded) : '—'}</td>
+                          <td className="num">
+                            {r.estimated ? formatINR(r.estimated) : '—'}
+                            {r.unknown ? <div className="tiny muted">{r.unknown} without cost</div> : null}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
                 </div>
+              )}
+              <div className="card-foot tiny muted">
+                Recorded = batch purchase cost <Prov kind="actual" /> · Estimated = verified recipe cost per
+                portion <Prov kind="estimate" />
+              </div>
+            </Card>
+            <Card
+              title={
+                <h2>
+                  Delivery timelines <Prov kind="actual" />
+                </h2>
+              }
+            >
+              <div className="card-body small stack-sm">
+                {!a.delivery.orders ? (
+                  <p className="muted">No orders recorded in this period.</p>
+                ) : (
+                  <>
+                    <div className="verify-steps">
+                      <div>
+                        <span className="tiny muted">Orders</span>
+                        <strong>{a.delivery.orders}</strong>
+                      </div>
+                      <div>
+                        <span className="tiny muted">Median prep</span>
+                        <strong>{a.delivery.medianPrepMin ?? '—'} min</strong>
+                      </div>
+                      <div>
+                        <span className="tiny muted">Median pickup wait</span>
+                        <strong>{a.delivery.medianReadyWaitMin ?? '—'} min</strong>
+                      </div>
+                      <div>
+                        <span className="tiny muted">Median delivery</span>
+                        <strong>{a.delivery.medianDeliveryMin ?? '—'} min</strong>
+                      </div>
+                    </div>
+                    <p>
+                      {a.delivery.waitedOverWarning} of {a.delivery.withWaitRecorded} orders with a recorded
+                      pickup wait waited at or above the warning threshold.{' '}
+                      {a.delivery.cancelledOrUncollected} cancelled or uncollected.
+                    </p>
+                  </>
+                )}
+                <p className="tiny muted">{a.delivery.note}</p>
               </div>
             </Card>
           </div>

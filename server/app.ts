@@ -6,6 +6,9 @@ import { csrfGuard, loadUser, outletAccess } from './auth';
 import type { Db } from './db/database';
 import { errorHandler, notFound } from './http';
 import { authRoutes } from './routes/auth';
+import { demoRoutes, demoScenarioRoutes } from './routes/demo';
+import { orderRoutes } from './routes/orders';
+import { whatIfRoutes } from './routes/whatif';
 import { decisionRoutes } from './routes/decisions';
 import { insightRoutes } from './routes/insights';
 import { inventoryRoutes } from './routes/inventory';
@@ -45,6 +48,7 @@ export function createApp(opts: AppOptions) {
   api.use(csrfGuard);
   api.get('/health', (_req, res) => res.json({ ok: true }));
   api.use('/auth', authRoutes(deps, !!opts.secureCookies));
+  api.use('/demo', demoRoutes(deps, !!opts.secureCookies));
 
   const { outletsRouter, outletScoped } = outletRoutes(deps);
   api.use('/outlets', outletsRouter);
@@ -57,6 +61,9 @@ export function createApp(opts: AppOptions) {
     salesRoutes(deps),
     operationsRoutes(deps),
     decisionRoutes(deps),
+    orderRoutes(deps),
+    whatIfRoutes(deps),
+    demoScenarioRoutes(deps),
     insightRoutes(deps),
   );
   api.use((_req, _res, next) => next(notFound('API route')));

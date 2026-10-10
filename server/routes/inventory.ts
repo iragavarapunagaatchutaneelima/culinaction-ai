@@ -262,6 +262,7 @@ export function inventoryRoutes({ db, now }: Deps) {
           dateValue: b.date_value,
           quarantined: !!b.quarantined,
           qualityCheckedOn: b.quality_checked_on,
+          storageVerifiedOn: b.storage_verified_on ?? null,
           source: b.source,
           status: b.qty_remaining > 0 ? s.status : 'empty',
           statusReason: s.reason,
@@ -464,6 +465,7 @@ export function inventoryRoutes({ db, now }: Deps) {
       z.object({
         quarantined: z.boolean().optional(),
         qualityChecked: z.literal(true).optional(),
+        storageVerified: z.literal(true).optional(),
         note: optText(200),
       }),
       req.body,
@@ -476,6 +478,12 @@ export function inventoryRoutes({ db, now }: Deps) {
       if (b.quarantined !== undefined)
         await db.run('UPDATE inventory_batches SET quarantined = ?, updated_at = ? WHERE id = ?', [
           b.quarantined ? 1 : 0,
+          iso(now()),
+          batch.id,
+        ]);
+      if (b.storageVerified)
+        await db.run('UPDATE inventory_batches SET storage_verified_on = ?, updated_at = ? WHERE id = ?', [
+          outletToday(req.outlet!, now()),
           iso(now()),
           batch.id,
         ]);

@@ -3,10 +3,11 @@ import { z } from 'zod';
 import { addDays, formatDate } from '../../shared/dates';
 import { ENGINE_VERSION, runEngine } from '../../shared/engine';
 import { canApprove, nextStatus, type PlanAction, type PlanStatus } from '../../shared/planState';
+import { ruleBasedExplanation } from '../../shared/explain';
 import type { PlanLineDraft, Recommendation } from '../../shared/types';
 import { formatQty, roundQty, toBase, type BaseUnit } from '../../shared/units';
 import type { AiProvider } from '../ai/provider';
-import { requireRole } from '../auth';
+import { requireRole, type OutletRow } from '../auth';
 import type { Db } from '../db/database';
 import { badRequest, conflict, forbidden, idParam, notFound, parse } from '../http';
 import {
@@ -17,10 +18,12 @@ import {
   getIngredient,
   iso,
   loadSnapshot,
+  insertMany,
   outletToday,
   type Deps,
 } from '../services';
 import { isoDate, optText } from '../validation';
+import { recordMenuItemWaste } from './operations';
 
 interface PlanRow {
   id: number;
@@ -95,6 +98,10 @@ function taskTitle(l: LineRow, qty: number | null): string {
       return `Remove and record waste: ${l.subject_name} (${q})`;
     case 'count':
       return `Count ${l.subject_name} and record actual quantity`;
+    case 'dispose_order':
+      return `Dispose of and record food from ${l.subject_name} (${q})`;
+    case 'order_action':
+      return `${l.subject_name}: ${l.note ?? 'follow up'}`;
     default:
       return `Check: ${l.subject_name}${l.note ? ` — ${l.note}` : ''}`;
   }
@@ -133,11 +140,14 @@ function itemDto(row: {
   ai_model: string | null;
   ai_generated_at: string | null;
 }) {
+  const rec = JSON.parse(row.payload_json) as Recommendation;
   return {
     id: row.id,
     runId: row.run_id,
     position: row.position,
-    ...(JSON.parse(row.payload_json) as Recommendation),
+    ...rec,
+    /** Deterministic summary built only from the engine's own text — always available, never AI. */
+    ruleBased: ruleBasedExplanation(rec),
     ai: row.ai_status
       ? {
           status: row.ai_status,
@@ -202,6 +212,117 @@ export async function runDto(db: Db, runId: number) {
   };
 }
 
+/** Runs the engine on current records and stores the run, its items, forecasts and order risk assessments. */
+export async function createRun(
+  db: Db,
+  outlet: OutletRow,
+  userId: number,
+  planDate: string,
+  now: Date,
+): Promise<number> {
+  const today = outletToday(outlet, now);
+  const result = runEngine(await loadSnapshot(db, outlet, planDate, now));
+  const ts = iso(now);
+  return db.tx(async () => {
+    const { lastId } = await db.run(
+      'INSERT INTO recommendation_runs (outlet_id, plan_date, business_today, engine_version, summary_json, stock_json, created_by, created_at) VALUES (?,?,?,?,?,?,?,?)',
+      [
+        outlet.id,
+        planDate,
+        today,
+        ENGINE_VERSION,
+        JSON.stringify(result.summary),
+        JSON.stringify(result.stock),
+        userId,
+        ts,
+      ],
+    );
+    await insertMany(
+      db,
+      'recommendation_items',
+      [
+        'run_id',
+        'outlet_id',
+        'position',
+        'rec_key',
+        'kind',
+        'severity_tier',
+        'title',
+        'estimated_impact_paise',
+        'confidence',
+        'payload_json',
+      ],
+      result.recommendations.map((rec, i) => [
+        lastId,
+        outlet.id,
+        i,
+        rec.key,
+        rec.kind,
+        rec.severityTier,
+        rec.title,
+        rec.estimatedImpactPaise,
+        rec.confidence,
+        JSON.stringify(rec),
+      ]),
+      40,
+    );
+    await insertMany(
+      db,
+      'forecast_snapshots',
+      [
+        'run_id',
+        'outlet_id',
+        'target_date',
+        'menu_item_id',
+        'method',
+        'forecast_mean',
+        'forecast_min',
+        'forecast_max',
+        'days_used',
+        'created_at',
+      ],
+      result.forecasts.map((f) => [
+        lastId,
+        outlet.id,
+        f.targetDate,
+        f.menuItemId,
+        f.method,
+        f.mean,
+        f.min,
+        f.max,
+        f.daysUsed,
+        ts,
+      ]),
+    );
+    await insertMany(
+      db,
+      'risk_assessments',
+      ['outlet_id', 'order_id', 'run_id', 'level', 'factors_json', 'assessed_at'],
+      result.orderRisks.map((r) => [
+        outlet.id,
+        r.orderId,
+        lastId,
+        r.level,
+        JSON.stringify({ factors: r.factors, missing: r.missing }),
+        ts,
+      ]),
+    );
+    await audit(
+      db,
+      {
+        outletId: outlet.id,
+        userId,
+        entityType: 'recommendation_run',
+        entityId: lastId,
+        action: 'run',
+        details: { planDate, count: result.recommendations.length },
+      },
+      now,
+    );
+    return lastId;
+  });
+}
+
 export function decisionRoutes({ db, now, ai }: Deps & { ai: AiProvider }) {
   const r = Router({ mergeParams: true });
   const editors = requireRole('owner', 'manager');
@@ -217,69 +338,7 @@ export function decisionRoutes({ db, now, ai }: Deps & { ai: AiProvider }) {
       throw badRequest('Plan date must be between today and 7 days ahead.', {
         fields: { planDate: 'Today to +7 days' },
       });
-    const result = runEngine(await loadSnapshot(db, req.outlet!, planDate, now()));
-    const ts = iso(now());
-    const runId = await db.tx(async () => {
-      const { lastId } = await db.run(
-        'INSERT INTO recommendation_runs (outlet_id, plan_date, business_today, engine_version, summary_json, stock_json, created_by, created_at) VALUES (?,?,?,?,?,?,?,?)',
-        [
-          req.outlet!.id,
-          planDate,
-          today,
-          ENGINE_VERSION,
-          JSON.stringify(result.summary),
-          JSON.stringify(result.stock),
-          req.user!.id,
-          ts,
-        ],
-      );
-      for (const [i, rec] of result.recommendations.entries())
-        await db.run(
-          'INSERT INTO recommendation_items (run_id, outlet_id, position, rec_key, kind, severity_tier, title, estimated_impact_paise, confidence, payload_json) VALUES (?,?,?,?,?,?,?,?,?,?)',
-          [
-            lastId,
-            req.outlet!.id,
-            i,
-            rec.key,
-            rec.kind,
-            rec.severityTier,
-            rec.title,
-            rec.estimatedImpactPaise,
-            rec.confidence,
-            JSON.stringify(rec),
-          ],
-        );
-      for (const f of result.forecasts) {
-        await db.run(
-          'INSERT INTO forecast_snapshots (run_id, outlet_id, target_date, menu_item_id, method, forecast_mean, forecast_min, forecast_max, days_used, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
-          [
-            lastId,
-            req.outlet!.id,
-            f.targetDate,
-            f.menuItemId,
-            f.method,
-            f.mean,
-            f.min,
-            f.max,
-            f.daysUsed,
-            ts,
-          ],
-        );
-      }
-      await audit(
-        db,
-        {
-          outletId: req.outlet!.id,
-          userId: req.user!.id,
-          entityType: 'recommendation_run',
-          entityId: lastId,
-          action: 'run',
-          details: { planDate, count: result.recommendations.length },
-        },
-        now(),
-      );
-      return lastId;
-    });
+    const runId = await createRun(db, req.outlet!, req.user!.id, planDate, now());
     res.status(201).json(await runDto(db, runId));
   });
 
@@ -338,21 +397,27 @@ export function decisionRoutes({ db, now, ai }: Deps & { ai: AiProvider }) {
   r.post('/recommendations/items/:iid/explain', editors, async (req, res) => {
     const row = await getItem(req.outlet!.id, idParam(req, 'iid'));
     const rec = JSON.parse(row.payload_json) as Recommendation;
+    if (req.user!.isDemo) {
+      // Demo visitors share the server's AI budget: cap explanation requests per demo session.
+      const used = (await db.get<{ n: number }>(
+        "SELECT COUNT(*) AS n FROM audit_events WHERE user_id = ? AND action = 'explain'",
+        [req.user!.id],
+      ))!.n;
+      if (used >= 15)
+        throw badRequest(
+          'The demo limit for AI explanations has been reached. The rule-based summary is still available.',
+        );
+    }
     const result = await ai.explain(rec, { outletType: req.outlet!.outlet_type, city: req.outlet!.city });
     const ts = iso(now());
     if (result.ok) {
       await db.run(
         "UPDATE recommendation_items SET ai_status = 'ok', ai_explanation_json = ?, ai_error = NULL, ai_model = ?, ai_generated_at = ? WHERE id = ?",
-        [
-          JSON.stringify({ ...result.explanation, unmatchedNumbers: result.unmatchedNumbers }),
-          result.model,
-          ts,
-          row.id,
-        ],
+        [JSON.stringify(result.explanation), result.model, ts, row.id],
       );
     } else {
       await db.run(
-        'UPDATE recommendation_items SET ai_status = ?, ai_error = ?, ai_generated_at = ? WHERE id = ?',
+        'UPDATE recommendation_items SET ai_status = ?, ai_error = ?, ai_explanation_json = NULL, ai_generated_at = ? WHERE id = ?',
         [result.code, result.message, ts, row.id],
       );
     }
@@ -795,6 +860,7 @@ export function decisionRoutes({ db, now, ai }: Deps & { ai: AiProvider }) {
         actualQty: z.coerce.number().finite().min(0).max(10_000_000).nullish(),
         notes: optText(300),
         qualityOk: z.boolean().optional(),
+        delayReason: optText(200),
       }),
       req.body ?? {},
     );
@@ -871,13 +937,93 @@ export function decisionRoutes({ db, now, ai }: Deps & { ai: AiProvider }) {
         }
         if (t.line_type === 'verify' && t.subject_type === 'batch' && b.qualityOk) {
           const batch = await getBatch(db, req.outlet!.id, t.subject_id);
-          if (batch.date_type === 'best_before') {
+          const today = outletToday(req.outlet!, now());
+          if (batch.date_type === 'best_before' && batch.date_value && batch.date_value < today) {
             await db.run('UPDATE inventory_batches SET quality_checked_on = ?, updated_at = ? WHERE id = ?', [
-              outletToday(req.outlet!, now()),
+              today,
               ts,
               batch.id,
             ]);
             effects.push('Quality check recorded for today');
+          } else {
+            await db.run(
+              'UPDATE inventory_batches SET storage_verified_on = ?, updated_at = ? WHERE id = ?',
+              [today, ts, batch.id],
+            );
+            effects.push('Storage check recorded for today');
+          }
+        }
+        if (t.line_type === 'order_action' || t.line_type === 'dispose_order') {
+          const order = await db.get<{
+            id: number;
+            order_ref: string;
+            status: string;
+            disposition: string | null;
+          }>('SELECT id, order_ref, status, disposition FROM orders WHERE id = ? AND outlet_id = ?', [
+            t.subject_id,
+            req.outlet!.id,
+          ]);
+          if (!order) throw notFound('Order');
+          if (b.delayReason) {
+            await db.run('UPDATE orders SET delay_reason = ?, updated_at = ? WHERE id = ?', [
+              b.delayReason,
+              ts,
+              order.id,
+            ]);
+            effects.push(`Delay reason recorded on order ${order.order_ref}`);
+          }
+          if (t.line_type === 'dispose_order') {
+            if (order.disposition)
+              throw conflict(`Order ${order.order_ref} already has a recorded disposition.`);
+            if (!['cancelled', 'uncollected', 'returned'].includes(order.status))
+              throw conflict(
+                `Order ${order.order_ref} is ${order.status}; only cancelled, uncollected or returned orders can be disposed.`,
+              );
+            const reason =
+              order.status === 'returned'
+                ? 'returned'
+                : order.status === 'uncollected'
+                  ? 'uncollected_order'
+                  : 'cancelled_order';
+            const items = await db.all<{ menu_item_id: number; qty: number; name: string }>(
+              'SELECT oi.menu_item_id, oi.qty, m.name FROM order_items oi JOIN menu_items m ON m.id = oi.menu_item_id WHERE oi.order_id = ?',
+              [order.id],
+            );
+            for (const it of items) {
+              await recordMenuItemWaste(db, req.outlet!, req.user!.id, now(), {
+                menuItemId: it.menu_item_id,
+                qty: it.qty,
+                occurredAt: ts,
+                reason,
+                notes: b.notes ?? `Order ${order.order_ref} (plan task #${tid})`,
+                servicePeriod: null,
+                source: 'task',
+                orderId: order.id,
+              });
+            }
+            await db.run('UPDATE orders SET disposition = ?, status = ?, updated_at = ? WHERE id = ?', [
+              'disposed',
+              'closed',
+              ts,
+              order.id,
+            ]);
+            await db.run(
+              'INSERT INTO order_events (order_id, outlet_id, event_type, occurred_at, reason, note, source, user_id, created_at) VALUES (?,?,?,?,?,?,?,?,?)',
+              [
+                order.id,
+                req.outlet!.id,
+                'closed',
+                ts,
+                'Food disposed and recorded',
+                `Plan task #${tid}`,
+                'task',
+                req.user!.id,
+                ts,
+              ],
+            );
+            effects.push(
+              `Recorded ${items.reduce((a, i) => a + i.qty, 0)} portion(s) from order ${order.order_ref} as waste (${reason.replace('_', ' ')}) and closed the order`,
+            );
           }
         }
         if (t.line_type === 'purchase')
